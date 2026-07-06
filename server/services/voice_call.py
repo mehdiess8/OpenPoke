@@ -39,6 +39,16 @@ class CallSessionLog:
     def record_reply(self, text: str) -> None:
         self._append("clinic_reply", text)
 
+    # Record that the caller interrupted the last reply mid-speech.
+    # The full intended reply stays in the log (honest record); this marker
+    # tells the agent how much the caller actually HEARD before cutting in.
+    def record_interruption(self, heard_text: str) -> None:
+        heard = heard_text.strip() or "(nothing — cut off immediately)"
+        self._append(
+            "interruption",
+            f'Caller interrupted the previous reply. They only heard: "{heard}"',
+        )
+
     # Load the full transcript of the active call ("" when no call)
     def load_transcript(self) -> str:
         if not self._path.exists():

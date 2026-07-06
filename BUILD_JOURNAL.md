@@ -68,7 +68,24 @@ One assistant, two channels. The existing OpenPoke interaction agent is extended
 - `web/app/call/page.tsx` (NEW) — the call UI. Turn-taking state machine: `listening → thinking → speaking → listening`. Chrome `SpeechRecognition` (STT, `isFinal` results = endpointing delegated to the browser) + `speechSynthesis` (TTS). **Barge-in:** mic stays open while speaking; interim speech during TTS → `speechSynthesis.cancel()`. Chrome auto-stops recognition after silence → `onend` restarts it while the call is live. Live transcript with bubbles, interim text shown italic, recap banner after hang-up.
 - `web/components/chat/ChatHeader.tsx` — +📞 Call link.
 - Known limits (say in demo): Chrome-only; silence-based endpointing (not semantic, not tunable); robotic TTS voices; echo can self-trigger barge-in without headphones.
-- **Upgrade path noted (Mehdi):** OpenRouter serves STT/TTS models via API — one vendor for all three cascade stages, server-side, more voice control. Drop-in swap because every stage boundary is just text.
+- **Upgrade path noted :** OpenRouter serves STT/TTS models via API — one vendor for all three cascade stages, server-side, more voice control. Drop-in swap because every stage boundary is just text.
+
+### Barge-in state reconciliation (interruption handling done right)
+
+**The bug (caught during testing):** replies are recorded to the call log at tool-execution time — before TTS speaks. On barge-in, the UI showed the full reply text and the agent's context contained words the caller never heard (e.g. cut off mid "your appointment is Tuesday at—" → agent believes the caller knows the time).
+
+**The fix — sync display and state to what was actually spoken:**
+- `call/page.tsx` — reply bubbles now reveal word-by-word driven by TTS `onboundary` events (`charIndex`): the screen never shows unspoken words. On barge-in: cancel TTS, commit only the heard prefix (`"...Tuesday at —"`) to the transcript, POST the prefix to `/voice/interrupted`. Same truncation on hang-up mid-speech (no server note — call is over).
+- `routes/voice.py` — `POST /voice/interrupted` (NEW) → `call_session.record_interruption(heard)`.
+- `voice_call.py` — `record_interruption()`: appends an `<interruption>` marker quoting exactly what was heard. Full intended reply stays in the log (honest record); the marker annotates it.
+- `voice_addendum.md` — teaches the model: a reply followed by `<interruption>` was only heard up to the quote; re-confirm anything important that fell after the cutoff.
+- **Design choice:** annotate, don't rewrite. The log keeps what the agent intended AND what the caller heard — auditable, and the model re-confirms naturally.
+
+### Fixes from noisy-room stress test (2026-07-06 ~12:50)
+
+- **Hang-up race:** a turn in flight at hang-up finished AFTER `/voice/end` cleared the session — its reply recreated `active_call.log` as a ghost transcript polluting the next call. Fix: `hangUp` waits (≤8s) for in-flight turns before ending.
+- **Repeated transfers:** agent called `transfer_to_human` on each successive garbled turn (3x). Fix: prompt rule — at most once per call, then reassure.
+- Positive findings from the same test: 7 barge-ins reconciled (incl. `heard 0 chars` edge), and the escalation ladder fired correctly on sustained garbled input — agent transferred to a human with a reasoned explanation rather than looping forever.
 
 ## Test log
 

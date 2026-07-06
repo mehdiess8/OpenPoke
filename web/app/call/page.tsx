@@ -9,6 +9,7 @@ export default function CallPage() {
   const [status, setStatus] = useState<CallStatus>('idle');
   const [turns, setTurns] = useState<Turn[]>([]);
   const [interim, setInterim] = useState('');
+  const [liveReply, setLiveReply] = useState<{ text: string; chars: number } | null>(null);
   const [recap, setRecap] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [browserWarning, setBrowserWarning] = useState<string | null>(null);
@@ -28,6 +29,9 @@ export default function CallPage() {
   const inFlightRef = useRef(false);
   const inCallRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  // What the assistant is currently saying and how much has been spoken so far.
+  const replyRef = useRef<{ text: string; heardChars: number }>({ text: '', heardChars: 0 });
+  const interruptedRef = useRef(false);
 
   const setStatusBoth = useCallback((s: CallStatus) => {
     statusRef.current = s;
@@ -39,6 +43,8 @@ export default function CallPage() {
   }, [turns, interim]);
 
   // Speak a reply via browser TTS; mic stays open so the caller can barge in.
+  // The transcript bubble is revealed word-by-word via onboundary, so the
+  // screen never shows words that haven't been spoken yet.
   const speak = useCallback(
     (text: string) => {
       window.speechSynthesis.cancel();
@@ -47,14 +53,45 @@ export default function CallPage() {
       const voices = window.speechSynthesis.getVoices();
       const preferred = voices.find((v) => v.name.includes('Samantha') || v.name.includes('Google US English'));
       if (preferred) utterance.voice = preferred;
+
+      interruptedRef.current = false;
+      replyRef.current = { text, heardChars: 0 };
+      setLiveReply({ text, chars: 0 });
+
       utterance.onstart = () => setStatusBoth('speaking');
+      utterance.onboundary = (event: SpeechSynthesisEvent) => {
+        const heard = event.charIndex + ((event as any).charLength || 0);
+        replyRef.current.heardChars = heard;
+        setLiveReply({ text, chars: heard });
+      };
       utterance.onend = () => {
+        if (interruptedRef.current) return; // barge-in/hang-up already handled it
+        setTurns((prev) => [...prev, { role: 'assistant', text }]);
+        setLiveReply(null);
         if (inCallRef.current && statusRef.current === 'speaking') setStatusBoth('listening');
       };
       window.speechSynthesis.speak(utterance);
     },
     [setStatusBoth]
   );
+
+  // Barge-in: stop TTS, commit only what was actually heard to the transcript,
+  // and tell the server so the agent's context reflects reality.
+  const interruptSpeech = useCallback((notifyServer: boolean) => {
+    interruptedRef.current = true;
+    window.speechSynthesis.cancel();
+    const { text, heardChars } = replyRef.current;
+    const heard = text.slice(0, heardChars).trim();
+    setTurns((prev) => [...prev, { role: 'assistant', text: heard ? `${heard} —` : '(interrupted)' }]);
+    setLiveReply(null);
+    if (notifyServer) {
+      fetch('/api/voice/interrupted', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ heard }),
+      }).catch(() => {});
+    }
+  }, []);
 
   // Send one finished caller utterance to the agent and speak the reply.
   const sendUtterance = useCallback(
@@ -73,8 +110,8 @@ export default function CallPage() {
         });
         const data = await res.json();
         const reply: string = data?.reply || "Sorry, I didn't catch that. Could you say it again?";
-        setTurns((prev) => [...prev, { role: 'assistant', text: reply }]);
-        if (inCallRef.current) speak(reply);
+        if (inCallRef.current) speak(reply); // transcript bubble revealed as it's spoken
+        else setTurns((prev) => [...prev, { role: 'assistant', text: reply }]);
       } catch (e: any) {
         setError(e?.message || 'Connection error');
         setStatusBoth('listening');
@@ -116,7 +153,7 @@ export default function CallPage() {
       if (interimText) {
         // Barge-in: caller started talking while the assistant is speaking.
         if (window.speechSynthesis.speaking) {
-          window.speechSynthesis.cancel();
+          interruptSpeech(true);
           setStatusBoth('listening');
         }
         setInterim(interimText);
@@ -146,14 +183,24 @@ export default function CallPage() {
     recognitionRef.current = recognition;
     recognition.start();
     setStatusBoth('listening');
-  }, [sendUtterance, setStatusBoth]);
+  }, [sendUtterance, setStatusBoth, interruptSpeech]);
 
   const hangUp = useCallback(async () => {
     inCallRef.current = false;
     recognitionRef.current?.stop();
+    if (window.speechSynthesis.speaking) {
+      interruptSpeech(false); // commit only the heard prefix; no server note needed, call is over
+    }
     window.speechSynthesis.cancel();
     setInterim('');
     setStatusBoth('ended');
+
+    // Wait for any in-flight turn to finish; otherwise its reply lands after
+    // /voice/end clears the session and recreates a ghost call log.
+    const deadline = Date.now() + 8000;
+    while (inFlightRef.current && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
 
     try {
       const res = await fetch('/api/voice/end', { method: 'POST' });
@@ -162,7 +209,7 @@ export default function CallPage() {
     } catch {
       /* recap is best-effort */
     }
-  }, [setStatusBoth]);
+  }, [setStatusBoth, interruptSpeech]);
 
   useEffect(() => {
     return () => {
@@ -234,6 +281,13 @@ export default function CallPage() {
             </div>
           </div>
         ))}
+        {liveReply && (
+          <div className="flex justify-start">
+            <div className="max-w-[80%] rounded-2xl bg-gray-100 px-4 py-2 text-sm text-gray-900">
+              {liveReply.text.slice(0, liveReply.chars) || '…'}
+            </div>
+          </div>
+        )}
         {interim && (
           <div className="flex justify-end">
             <div className="max-w-[80%] rounded-2xl bg-blue-200 px-4 py-2 text-sm italic text-blue-900">

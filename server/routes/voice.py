@@ -63,6 +63,10 @@ class VoiceRequest(BaseModel):
     message: str
 
 
+class InterruptionRequest(BaseModel):
+    heard: str = ""
+
+
 # Scan an utterance for emergency language; return an alert string when flagged
 def _detect_red_flags(text: str) -> Optional[str]:
     match = _RED_FLAG_RE.search(text)
@@ -110,6 +114,18 @@ async def voice_send(payload: VoiceRequest) -> JSONResponse:
             "emergency_flagged": alert is not None,
         }
     )
+
+
+@router.post("/interrupted", response_class=JSONResponse, summary="Record that the caller interrupted the last reply")
+# Annotate the call log with how much of the last reply was actually heard
+async def voice_interrupted(payload: InterruptionRequest) -> JSONResponse:
+    session = get_call_session()
+    if not session.load_transcript():
+        return JSONResponse({"ok": True, "detail": "No active call."})
+
+    session.record_interruption(payload.heard)
+    logger.info(f"[voice] barge-in recorded (heard {len(payload.heard.strip())} chars)")
+    return JSONResponse({"ok": True})
 
 
 @router.post("/end", response_class=JSONResponse, summary="End the active call and post a recap to the chat")
