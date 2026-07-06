@@ -62,6 +62,14 @@ One assistant, two channels. The existing OpenPoke interaction agent is extended
 - `voice_addendum.md` — explains `<active_call>` vs `<conversation_history>` semantics to the model.
 - **Decision #6 implemented.** Chat UI stays clean; user gets one recap text after hanging up; the agent still recognizes returning callers via long-term memory.
 
+### Voice UI (browser Web Speech API)
+
+- `web/app/api/voice/route.ts` + `web/app/api/voice/end/route.ts` (NEW) — Next.js proxy routes to the Python voice endpoints (same pattern as the existing chat proxy: CORS-free, `PY_SERVER_URL` stays server-side).
+- `web/app/call/page.tsx` (NEW) — the call UI. Turn-taking state machine: `listening → thinking → speaking → listening`. Chrome `SpeechRecognition` (STT, `isFinal` results = endpointing delegated to the browser) + `speechSynthesis` (TTS). **Barge-in:** mic stays open while speaking; interim speech during TTS → `speechSynthesis.cancel()`. Chrome auto-stops recognition after silence → `onend` restarts it while the call is live. Live transcript with bubbles, interim text shown italic, recap banner after hang-up.
+- `web/components/chat/ChatHeader.tsx` — +📞 Call link.
+- Known limits (say in demo): Chrome-only; silence-based endpointing (not semantic, not tunable); robotic TTS voices; echo can self-trigger barge-in without headphones.
+- **Upgrade path noted (Mehdi):** OpenRouter serves STT/TTS models via API — one vendor for all three cascade stages, server-side, more voice control. Drop-in swap because every stage boundary is just text.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:
