@@ -62,16 +62,25 @@ class InteractionAgentRuntime:
             )
 
     # Main entry point for processing user messages through the LLM interaction loop
-    async def execute(self, user_message: str) -> InteractionResult:
-        """Handle a user-authored message."""
+    async def execute(
+        self,
+        user_message: str,
+        channel: str = "text",
+        emergency_alert: Optional[str] = None,
+    ) -> InteractionResult:
+        """Handle a user-authored message (from text chat or a voice call)."""
 
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
 
-            system_prompt = build_system_prompt()
+            system_prompt = build_system_prompt(channel=channel)
             messages = prepare_message_with_history(
-                user_message, transcript_before, message_type="user"
+                user_message,
+                transcript_before,
+                message_type="user",
+                channel=channel,
+                emergency_alert=emergency_alert,
             )
 
             logger.info("Processing user message through interaction agent")

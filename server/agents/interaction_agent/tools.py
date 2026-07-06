@@ -105,6 +105,10 @@ TOOL_SCHEMAS = [
     },
 ]
 
+from .intake_tools import INTAKE_TOOL_SCHEMAS, handle_intake_tool
+
+TOOL_SCHEMAS = TOOL_SCHEMAS + INTAKE_TOOL_SCHEMAS
+
 _EXECUTION_BATCH_MANAGER = ExecutionBatchManager()
 
 
@@ -233,6 +237,11 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             return send_draft(**args)
         if name == "wait":
             return wait(**args)
+
+        intake_result = handle_intake_tool(name, args)
+        if intake_result is not None:
+            success = intake_result.get("success", True) is not False and "error" not in intake_result
+            return ToolResult(success=success, payload=intake_result)
 
         logger.warning("unexpected tool", extra={"tool": name})
         return ToolResult(success=False, payload={"error": f"Unknown tool: {name}"})
