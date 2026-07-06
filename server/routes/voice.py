@@ -20,9 +20,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ..agents.interaction_agent.runtime import InteractionAgentRuntime
+from ..config import get_settings
 from ..logging_config import logger
+from ..openrouter_client import request_chat_completion
+from ..services.conversation import get_conversation_log
+from ..services.voice_call import get_call_session
 
 router = APIRouter(prefix="/voice", tags=["voice"])
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You summarize a clinic phone call into a short recap the assistant sends the user "
+    "by text right after hanging up. Two or three sentences, plain text, warm but brief. "
+    "Include the appointment day, time, and confirmation number if something was booked. "
+    "If the call involved an emergency or a transfer to staff, say that plainly. "
+    "Write in second person ('you called about...', 'you're booked for...')."
+)
 
 # Conservative emergency red flags. False positives are acceptable — the agent
 # asks ONE clarifying question on a flag; it does not immediately jump to 911.
@@ -98,6 +110,39 @@ async def voice_send(payload: VoiceRequest) -> JSONResponse:
             "emergency_flagged": alert is not None,
         }
     )
+
+
+@router.post("/end", response_class=JSONResponse, summary="End the active call and post a recap to the chat")
+# Summarize the finished call into the main conversation log, then clear the session
+async def voice_end() -> JSONResponse:
+    session = get_call_session()
+    transcript = session.load_transcript()
+
+    if not transcript:
+        return JSONResponse({"ok": True, "summary": None, "detail": "No active call to end."})
+
+    settings = get_settings()
+    try:
+        response = await request_chat_completion(
+            model=settings.summarizer_model,
+            messages=[{"role": "user", "content": f"Call transcript:\n\n{transcript}"}],
+            system=_SUMMARY_SYSTEM_PROMPT,
+            api_key=settings.openrouter_api_key,
+        )
+        summary = (response.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+    except Exception as exc:
+        logger.error(f"[voice] call summary failed: {exc}")
+        summary = ""
+
+    if not summary:
+        # Never lose the record — fall back to a minimal note.
+        summary = "We spoke on a call just now. If anything didn't get resolved, just text me here."
+
+    get_conversation_log().record_reply(f"Call recap: {summary}")
+    session.clear()
+
+    logger.info("[voice] call ended, recap posted to chat")
+    return JSONResponse({"ok": True, "summary": summary})
 
 
 __all__ = ["router"]

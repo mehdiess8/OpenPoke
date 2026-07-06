@@ -155,10 +155,15 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
 
 
 # Send immediate message to user and record in conversation history
-def send_message_to_user(message: str) -> ToolResult:
-    """Record a user-visible reply in the conversation log."""
-    log = get_conversation_log()
-    log.record_reply(message)
+def send_message_to_user(message: str, channel: str = "text") -> ToolResult:
+    """Record a user-visible reply: main conversation log, or the call session on voice."""
+    if channel == "voice":
+        from ...services.voice_call import get_call_session
+
+        get_call_session().record_reply(message)
+    else:
+        log = get_conversation_log()
+        log.record_reply(message)
 
     return ToolResult(
         success=True,
@@ -219,7 +224,7 @@ def get_tool_schemas():
 
 
 # Route tool calls to appropriate handlers with argument validation and error handling
-def handle_tool_call(name: str, arguments: Any) -> ToolResult:
+def handle_tool_call(name: str, arguments: Any, channel: str = "text") -> ToolResult:
     """Handle tool calls from interaction agent."""
     try:
         if isinstance(arguments, str):
@@ -232,7 +237,7 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
         if name == "send_message_to_agent":
             return send_message_to_agent(**args)
         if name == "send_message_to_user":
-            return send_message_to_user(**args)
+            return send_message_to_user(**args, channel=channel)
         if name == "send_draft":
             return send_draft(**args)
         if name == "wait":

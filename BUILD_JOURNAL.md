@@ -53,6 +53,15 @@ One assistant, two channels. The existing OpenPoke interaction agent is extended
 - `agents/interaction_agent/agent.py` — `build_system_prompt(channel)`; `prepare_message_with_history(..., channel, emergency_alert)`; current-turn tag gains `channel="voice"` attribute; `<emergency_screen_alert>` section injection.
 - `agents/interaction_agent/runtime.py` — `execute(user_message, channel="text", emergency_alert=None)` passthrough.
 
+### Call-session isolation + post-call recap (v2 memory model)
+
+- `server/services/voice_call.py` (NEW) — `CallSessionLog`: file-backed transcript of the active call (`server/data/active_call.log`), singleton, single active call (demo scope; production keys sessions by caller).
+- `runtime.py` — voice turns record to the call session, not the main log; context = long-term memory + `<active_call>` transcript. Channel threaded to tools via `_execute_tool`.
+- `tools.py` — `send_message_to_user(message, channel)`: voice replies land in the call session.
+- `routes/voice.py` — `POST /voice/end` (NEW): summarizes the call transcript with `summarizer_model`, posts one "Call recap: ..." message into the main chat, clears the session. Fallback recap on summarizer failure — never lose the record.
+- `voice_addendum.md` — explains `<active_call>` vs `<conversation_history>` semantics to the model.
+- **Decision #6 implemented.** Chat UI stays clean; user gets one recap text after hanging up; the agent still recognizes returning callers via long-term memory.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:

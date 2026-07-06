@@ -71,8 +71,23 @@ class InteractionAgentRuntime:
         """Handle a user-authored message (from text chat or a voice call)."""
 
         try:
+            self._channel = channel
             transcript_before = self._load_conversation_transcript()
-            self.conversation_log.record_user_message(user_message)
+
+            if channel == "voice":
+                # Voice turns are isolated in the call session; the agent still
+                # sees long-term memory plus the live call transcript.
+                from ...services.voice_call import get_call_session
+
+                call_session = get_call_session()
+                call_transcript = call_session.load_transcript()
+                if call_transcript:
+                    transcript_before = (
+                        f"{transcript_before}\n\n<active_call>\n{call_transcript}\n</active_call>"
+                    )
+                call_session.record_caller(user_message)
+            else:
+                self.conversation_log.record_user_message(user_message)
 
             system_prompt = build_system_prompt(channel=channel)
             messages = prepare_message_with_history(
@@ -89,7 +104,12 @@ class InteractionAgentRuntime:
             final_response = self._finalize_response(summary)
 
             if final_response and not summary.user_messages:
-                self.conversation_log.record_reply(final_response)
+                if channel == "voice":
+                    from ...services.voice_call import get_call_session
+
+                    get_call_session().record_reply(final_response)
+                else:
+                    self.conversation_log.record_reply(final_response)
 
             return InteractionResult(
                 success=True,
@@ -303,7 +323,9 @@ class InteractionAgentRuntime:
 
         try:
             self._log_tool_invocation(tool_call, stage="start")
-            result = handle_tool_call(tool_call.name, tool_call.arguments)
+            result = handle_tool_call(
+                tool_call.name, tool_call.arguments, channel=getattr(self, "_channel", "text")
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error(
                 "Tool execution crashed",
