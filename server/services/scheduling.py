@@ -1,9 +1,9 @@
-"""Clinic scheduling service — mock implementation.
+"""Clinic scheduling service.
 
 Backs the intake tools (patient lookup, availability, booking, escalation,
-human transfer). Slot/booking logic sits behind module-level functions so a
-real calendar backend (Composio Google Calendar) can replace the mock without
-touching the tool layer.
+human transfer). Availability and booking use Google Calendar via Composio
+when connected; otherwise they fall back to the mock so the demo never
+blocks on OAuth. The tool layer above never knows the difference.
 """
 
 from __future__ import annotations
@@ -13,8 +13,14 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from ..logging_config import logger
+from .timezone_store import get_timezone_store
+
+_APPOINTMENT_MINUTES = 30
+_CLINIC_OPEN_HOUR = 9
+_CLINIC_LAST_START = (16, 30)  # last bookable start time
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _BOOKINGS_PATH = _DATA_DIR / "clinic_bookings.json"
@@ -43,9 +49,72 @@ _MOCK_PATIENTS: Dict[str, Dict[str, str]] = {
 }
 
 # Slots offered in the current conversation, so book_appointment can resolve ids.
+# Calendar-backed slots carry a "start_iso" key; mock slots don't.
 _OFFERED_SLOTS: Dict[str, Dict[str, str]] = {}
 
 _SLOT_TIMES = ["9:20 AM", "10:40 AM", "1:30 PM", "2:40 PM", "4:10 PM"]
+
+
+def _clinic_tz() -> ZoneInfo:
+    name = get_timezone_store().get_timezone(default="America/Toronto")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("America/Toronto")
+
+
+def _day_offsets(urgency: str) -> List[int]:
+    if urgency == "same_day":
+        return [0]
+    if urgency == "soon":
+        return [1, 2]
+    return [5, 7, 8]  # routine
+
+
+# Generate every bookable 30-min start within clinic hours for the target days
+def _candidate_slots(urgency: str) -> List[Dict[str, Any]]:
+    tz = _clinic_tz()
+    now = datetime.now(tz)
+    candidates: List[Dict[str, Any]] = []
+
+    for offset in _day_offsets(urgency):
+        day = (now + timedelta(days=offset)).date()
+        cursor = datetime(day.year, day.month, day.day, _CLINIC_OPEN_HOUR, 0, tzinfo=tz)
+        last = datetime(day.year, day.month, day.day, *_CLINIC_LAST_START, tzinfo=tz)
+        while cursor <= last:
+            if cursor > now + timedelta(hours=1):  # never offer slots in the immediate past
+                candidates.append(
+                    {
+                        "start": cursor,
+                        "date": cursor.strftime("%A, %B %d"),
+                        "time": cursor.strftime("%-I:%M %p"),
+                    }
+                )
+            cursor += timedelta(minutes=_APPOINTMENT_MINUTES)
+    return candidates
+
+
+# Pull busy [(start, end)] ranges out of the free/busy response, defensively
+def _extract_busy_ranges(response: Dict[str, Any], tz: ZoneInfo) -> List[Any]:
+    busy_ranges = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            busy = node.get("busy")
+            if isinstance(busy, list):
+                for entry in busy:
+                    if isinstance(entry, dict) and entry.get("start") and entry.get("end"):
+                        try:
+                            start = datetime.fromisoformat(str(entry["start"]).replace("Z", "+00:00"))
+                            end = datetime.fromisoformat(str(entry["end"]).replace("Z", "+00:00"))
+                            busy_ranges.append((start.astimezone(tz), end.astimezone(tz)))
+                        except ValueError:
+                            continue
+            for value in node.values():
+                _walk(value)
+
+    _walk(response)
+    return busy_ranges
 
 
 def _append_json(path: Path, record: Dict[str, Any]) -> None:
@@ -73,35 +142,74 @@ def lookup_patient(full_name: str, date_of_birth: str) -> Dict[str, Any]:
 
 
 def check_availability(urgency_level: str, preference: str = "") -> Dict[str, Any]:
-    """Return open slots for the requested urgency window (mocked)."""
+    """Return open slots: real Google Calendar free/busy when connected, mock otherwise."""
     urgency = urgency_level.strip().lower()
+
+    from .calendar_client import execute_calendar_tool, is_calendar_connected
+
+    if is_calendar_connected():
+        try:
+            tz = _clinic_tz()
+            candidates = _candidate_slots(urgency)
+            if not candidates:
+                return {"urgency_level": urgency, "slots": [], "note": "No slots left in this window."}
+
+            response = execute_calendar_tool(
+                "GOOGLECALENDAR_FIND_FREE_SLOTS",
+                {
+                    "items": ["primary"],
+                    "time_min": candidates[0]["start"].isoformat(),
+                    "time_max": (candidates[-1]["start"] + timedelta(minutes=_APPOINTMENT_MINUTES)).isoformat(),
+                    "timezone": str(tz),
+                },
+            )
+            busy = _extract_busy_ranges(response, tz)
+
+            free = [
+                c for c in candidates
+                if not any(
+                    b_start < c["start"] + timedelta(minutes=_APPOINTMENT_MINUTES) and c["start"] < b_end
+                    for b_start, b_end in busy
+                )
+            ]
+
+            # Spread the offering across the window instead of clustering at 9am.
+            step = max(1, len(free) // 4)
+            chosen = free[::step][:4]
+
+            slots: List[Dict[str, str]] = []
+            for c in chosen:
+                slot_id = f"S{len(_OFFERED_SLOTS) + len(slots) + 1:03d}"
+                slot = {
+                    "slot_id": slot_id,
+                    "date": c["date"],
+                    "time": c["time"],
+                    "start_iso": c["start"].strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                slots.append(slot)
+                _OFFERED_SLOTS[slot_id] = slot
+
+            logger.info(
+                f"[scheduling] calendar: {len(busy)} busy ranges, {len(free)} free candidates, offering {len(slots)} (urgency={urgency})"
+            )
+            return {"urgency_level": urgency, "preference": preference, "slots": slots, "source": "google_calendar"}
+        except Exception as exc:
+            logger.warning(f"[scheduling] calendar availability failed, falling back to mock: {exc}")
+
+    # ── Mock fallback (calendar not connected or query failed) ──
     now = datetime.now()
-
-    if urgency == "same_day":
-        day_offsets = [0]
-    elif urgency == "soon":
-        day_offsets = [1, 2]
-    else:  # routine
-        day_offsets = [5, 7, 8]
-
-    slots: List[Dict[str, str]] = []
-    for offset in day_offsets:
+    slots = []
+    for offset in _day_offsets(urgency):
         day = now + timedelta(days=offset)
         for time_str in random.sample(_SLOT_TIMES, k=2):
             slot_id = f"S{len(_OFFERED_SLOTS) + len(slots) + 1:03d}"
-            slots.append(
-                {
-                    "slot_id": slot_id,
-                    "date": day.strftime("%A, %B %d"),
-                    "time": time_str,
-                }
-            )
+            slots.append({"slot_id": slot_id, "date": day.strftime("%A, %B %d"), "time": time_str})
 
     for slot in slots:
         _OFFERED_SLOTS[slot["slot_id"]] = slot
 
-    logger.info(f"[scheduling] offered {len(slots)} slots for urgency={urgency}")
-    return {"urgency_level": urgency, "preference": preference, "slots": slots}
+    logger.info(f"[scheduling] mock: offered {len(slots)} slots for urgency={urgency}")
+    return {"urgency_level": urgency, "preference": preference, "slots": slots, "source": "mock"}
 
 
 def book_appointment(
@@ -128,9 +236,42 @@ def book_appointment(
         "callback_number": callback_number,
         "booked_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+    # Create the real calendar event when this slot came from Google Calendar.
+    calendar_synced = False
+    if slot.get("start_iso"):
+        from .calendar_client import execute_calendar_tool, is_calendar_connected
+
+        if is_calendar_connected():
+            try:
+                event = execute_calendar_tool(
+                    "GOOGLECALENDAR_CREATE_EVENT",
+                    {
+                        "calendar_id": "primary",
+                        "start_datetime": slot["start_iso"],
+                        "event_duration_minutes": _APPOINTMENT_MINUTES,
+                        "timezone": str(_clinic_tz()),
+                        "summary": f"Appointment: {patient_name} — {reason_for_visit}",
+                        "description": (
+                            f"Confirmation: {confirmation}\n"
+                            f"Callback: {callback_number}\n"
+                            f"Booked by Maple voice assistant"
+                        ),
+                        "create_meeting_room": False,
+                    },
+                )
+                calendar_synced = True
+                logger.info(f"[scheduling] calendar event created for {confirmation}")
+            except Exception as exc:
+                logger.warning(f"[scheduling] calendar event creation failed: {exc}")
+
+    booking["calendar_synced"] = calendar_synced
     _append_json(_BOOKINGS_PATH, booking)
-    logger.info(f"[scheduling] booked {confirmation} for {patient_name}")
-    return {"success": True, **booking}
+    logger.info(f"[scheduling] booked {confirmation} for {patient_name} (calendar_synced={calendar_synced})")
+    result = {"success": True, **booking}
+    if slot.get("start_iso") and not calendar_synced:
+        result["note"] = "Booking saved locally but the calendar sync failed — mention that staff will confirm the exact time."
+    return result
 
 
 def escalate_emergency(summary: str) -> Dict[str, Any]:

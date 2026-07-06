@@ -87,6 +87,21 @@ One assistant, two channels. The existing OpenPoke interaction agent is extended
 - **Repeated transfers:** agent called `transfer_to_human` on each successive garbled turn (3x). Fix: prompt rule — at most once per call, then reassure.
 - Positive findings from the same test: 7 barge-ins reconciled (incl. `heard 0 chars` edge), and the escalation ladder fired correctly on sustained garbled input — agent transferred to a human with a reasoned explanation rather than looping forever.
 
+### Google Calendar integration (real availability + booking)
+
+- `server/services/calendar_client.py` (NEW) — Composio calendar: `initiate_calendar_connect()` (link flow, same as the Gmail fix), `calendar_status()`, `execute_calendar_tool()`. Reuses the Gmail Composio client singleton. Connection state persisted to `server/data/calendar_connection.json` (survives --reload, unlike Gmail's in-memory user id).
+- `server/routes/calendar.py` (NEW) — `POST /calendar/connect`, `GET /calendar/status`.
+- `config.py` — `COMPOSIO_GOOGLE_CALENDAR_AUTH_CONFIG_ID` setting.
+- `scheduling.py` — the interface swap, exactly as designed (decision #4):
+  - `check_availability`: generates candidate 30-min slots within clinic hours (9:00–16:30) for the urgency window, queries `GOOGLECALENDAR_FIND_FREE_SLOTS` (free/busy), filters overlaps, offers ~4 spread across the window. **Falls back to mock on any failure or when not connected** — the demo can never be killed by OAuth/network.
+  - `book_appointment`: calendar-backed slots carry `start_iso`; booking creates a real `GOOGLECALENDAR_CREATE_EVENT` (30 min, confirmation number + callback in description). If event creation fails, booking still succeeds locally with a note telling the agent to say staff will confirm.
+  - Tool slugs + argument schemas verified against the live Composio API before writing (e.g. `event_duration_minutes` must be ≤59; durations of 1h+ use `event_duration_hour`).
+- Timezone from the existing `timezone_store` (default America/Toronto).
+- The agent/tool layer needed ZERO changes — the swap happened entirely behind the service interface, as designed on day one.
+
+### Parking lot additions
+- Better TTS voice: browser TTS sounds robotic — swap to OpenRouter/ElevenLabs TTS server-side; also consider better STT. Cascade boundaries are text, so this is frontend-only or a new `/voice/tts` endpoint.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:

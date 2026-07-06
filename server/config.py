@@ -60,6 +60,9 @@ class Settings(BaseModel):
     # Credentials / integrations
     openrouter_api_key: Optional[str] = Field(default=os.getenv("OPENROUTER_API_KEY"))
     composio_gmail_auth_config_id: Optional[str] = Field(default=os.getenv("COMPOSIO_GMAIL_AUTH_CONFIG_ID"))
+    composio_google_calendar_auth_config_id: Optional[str] = Field(
+        default=os.getenv("COMPOSIO_GOOGLE_CALENDAR_AUTH_CONFIG_ID")
+    )
     composio_api_key: Optional[str] = Field(default=os.getenv("COMPOSIO_API_KEY"))
 
     # HTTP behaviour
