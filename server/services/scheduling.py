@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from ..config import get_settings
 from ..logging_config import logger
 from .timezone_store import get_timezone_store
 
@@ -33,18 +35,21 @@ _MOCK_PATIENTS: Dict[str, Dict[str, str]] = {
         "full_name": "Mehdi Essoussi",
         "date_of_birth": "1999-03-14",
         "phone_on_file": "437-998-9777",
+        "email_on_file": "mehdi8.ess@gmail.com",
     },
     "alice nguyen": {
         "patient_id": "P-1002",
         "full_name": "Alice Nguyen",
         "date_of_birth": "1988-11-02",
         "phone_on_file": "416-555-0134",
+        "email_on_file": "alice.nguyen@example.com",
     },
     "james okafor": {
         "patient_id": "P-1003",
         "full_name": "James Okafor",
         "date_of_birth": "1975-06-21",
         "phone_on_file": "647-555-0192",
+        "email_on_file": "james.okafor@example.com",
     },
 }
 
@@ -72,12 +77,12 @@ def _day_offsets(urgency: str) -> List[int]:
 
 
 # Generate every bookable 30-min start within clinic hours for the target days
-def _candidate_slots(urgency: str) -> List[Dict[str, Any]]:
+def _candidate_slots(day_offsets: List[int]) -> List[Dict[str, Any]]:
     tz = _clinic_tz()
     now = datetime.now(tz)
     candidates: List[Dict[str, Any]] = []
 
-    for offset in _day_offsets(urgency):
+    for offset in day_offsets:
         day = (now + timedelta(days=offset)).date()
         cursor = datetime(day.year, day.month, day.day, _CLINIC_OPEN_HOUR, 0, tzinfo=tz)
         last = datetime(day.year, day.month, day.day, *_CLINIC_LAST_START, tzinfo=tz)
@@ -92,6 +97,50 @@ def _candidate_slots(urgency: str) -> List[Dict[str, Any]]:
                 )
             cursor += timedelta(minutes=_APPOINTMENT_MINUTES)
     return candidates
+
+
+_DAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+# Filter free slots by the caller's stated day/time preference.
+# Deterministic and explainable: day names, morning/afternoon, "after N", "N pm".
+# Returns (matching_slots, preference_was_understood).
+def _filter_by_preference(candidates: List[Dict[str, Any]], preference: str) -> Tuple[List[Dict[str, Any]], bool]:
+    p = (preference or "").strip().lower()
+    if not p:
+        return [], False
+
+    hits = candidates
+    matched = False
+
+    for index, name in enumerate(_DAY_NAMES):
+        if name in p:
+            hits = [c for c in hits if c["start"].weekday() == index]
+            matched = True
+            break
+
+    if "morning" in p:
+        hits = [c for c in hits if c["start"].hour < 12]
+        matched = True
+    elif "afternoon" in p:
+        hits = [c for c in hits if 12 <= c["start"].hour < 17]
+        matched = True
+
+    after = re.search(r"\bafter\s+(\d{1,2})\s*(am|pm)?\b", p)
+    if after:
+        hour = int(after.group(1))
+        if after.group(2) == "pm" or (after.group(2) is None and hour <= 8):
+            hour = hour % 12 + 12
+        hits = [c for c in hits if c["start"].hour >= hour]
+        matched = True
+    else:
+        exact = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", p)
+        if exact:
+            hour = int(exact.group(1)) % 12 + (12 if exact.group(3) == "pm" else 0)
+            hits = [c for c in hits if c["start"].hour == hour]
+            matched = True
+
+    return (hits if matched else []), matched
 
 
 # Pull busy [(start, end)] ranges out of the free/busy response, defensively
@@ -150,14 +199,20 @@ def check_availability(urgency_level: str, preference: str = "") -> Dict[str, An
     if is_calendar_connected():
         try:
             tz = _clinic_tz()
-            candidates = _candidate_slots(urgency)
+            # A stated preference widens the window to a continuous 10-day horizon:
+            # any day the caller names must actually be considered, not just the
+            # urgency bucket's days (the buckets have gaps, e.g. +3/+4 for routine).
+            if preference.strip():
+                candidates = _candidate_slots(list(range(0, 11)))
+            else:
+                candidates = _candidate_slots(_day_offsets(urgency))
             if not candidates:
                 return {"urgency_level": urgency, "slots": [], "note": "No slots left in this window."}
 
             response = execute_calendar_tool(
                 "GOOGLECALENDAR_FIND_FREE_SLOTS",
                 {
-                    "items": ["primary"],
+                    "items": [get_settings().clinic_calendar_id],
                     "time_min": candidates[0]["start"].isoformat(),
                     "time_max": (candidates[-1]["start"] + timedelta(minutes=_APPOINTMENT_MINUTES)).isoformat(),
                     "timezone": str(tz),
@@ -173,9 +228,21 @@ def check_availability(urgency_level: str, preference: str = "") -> Dict[str, An
                 )
             ]
 
-            # Spread the offering across the window instead of clustering at 9am.
-            step = max(1, len(free) // 4)
-            chosen = free[::step][:4]
+            # Honor the caller's stated preference when it matches free slots;
+            # otherwise spread the offering across the window.
+            preferred, understood = _filter_by_preference(free, preference)
+            matched_preference: Optional[bool] = None
+            if understood:
+                matched_preference = bool(preferred)
+            if preferred:
+                # Spread across ALL matches — taking the first N chronologically
+                # silently drops later times and the agent then (falsely) reports
+                # them unavailable.
+                step = max(1, len(preferred) // 5)
+                chosen = preferred[::step][:5]
+            else:
+                step = max(1, len(free) // 4)
+                chosen = free[::step][:4]
 
             slots: List[Dict[str, str]] = []
             for c in chosen:
@@ -190,9 +257,27 @@ def check_availability(urgency_level: str, preference: str = "") -> Dict[str, An
                 _OFFERED_SLOTS[slot_id] = slot
 
             logger.info(
-                f"[scheduling] calendar: {len(busy)} busy ranges, {len(free)} free candidates, offering {len(slots)} (urgency={urgency})"
+                f"[scheduling] calendar: {len(busy)} busy ranges, {len(free)} free candidates, "
+                f"offering {len(slots)} (urgency={urgency}, matched_preference={matched_preference})"
             )
-            return {"urgency_level": urgency, "preference": preference, "slots": slots, "source": "google_calendar"}
+            result: Dict[str, Any] = {
+                "urgency_level": urgency,
+                "preference": preference,
+                "slots": slots,
+                "source": "google_calendar",
+            }
+            if matched_preference is True:
+                extra = len(preferred) - len(chosen)
+                result["note"] = (
+                    "These slots match the caller's requested day/time."
+                    + (f" {extra} more matching slots exist — if none of these suit, check again with a narrower preference." if extra > 0 else "")
+                )
+            elif matched_preference is False:
+                result["note"] = (
+                    "No free slot matches the caller's requested day/time — it is genuinely "
+                    "unavailable. Offer these alternatives."
+                )
+            return result
         except Exception as exc:
             logger.warning(f"[scheduling] calendar availability failed, falling back to mock: {exc}")
 
@@ -217,13 +302,21 @@ def book_appointment(
     slot_id: str,
     reason_for_visit: str,
     callback_number: str,
+    patient_email: str = "",
 ) -> Dict[str, Any]:
     """Book a previously offered slot and persist the booking."""
     slot = _OFFERED_SLOTS.get(slot_id.strip())
     if slot is None:
+        logger.warning(
+            f"[scheduling] book failed — unknown slot_id '{slot_id}' "
+            f"(known: {sorted(_OFFERED_SLOTS.keys())[-8:]})"
+        )
         return {
             "success": False,
-            "error": f"Unknown slot id '{slot_id}'. Re-check availability and offer fresh options.",
+            "error": (
+                f"Unknown slot id '{slot_id}'. Use a slot_id EXACTLY as returned by your most "
+                "recent check_availability call — earlier slot ids may be stale."
+            ),
         }
 
     confirmation = f"MPL-{random.randint(1000, 9999)}"
@@ -244,22 +337,25 @@ def book_appointment(
 
         if is_calendar_connected():
             try:
-                event = execute_calendar_tool(
-                    "GOOGLECALENDAR_CREATE_EVENT",
-                    {
-                        "calendar_id": "primary",
-                        "start_datetime": slot["start_iso"],
-                        "event_duration_minutes": _APPOINTMENT_MINUTES,
-                        "timezone": str(_clinic_tz()),
-                        "summary": f"Appointment: {patient_name} — {reason_for_visit}",
-                        "description": (
-                            f"Confirmation: {confirmation}\n"
-                            f"Callback: {callback_number}\n"
-                            f"Booked by Maple voice assistant"
-                        ),
-                        "create_meeting_room": False,
-                    },
-                )
+                # Event lives on the CLINIC calendar; the patient is invited as an
+                # attendee, so Google delivers a copy to their calendar with RSVP.
+                event_args: Dict[str, Any] = {
+                    "calendar_id": get_settings().clinic_calendar_id,
+                    "start_datetime": slot["start_iso"],
+                    "event_duration_minutes": _APPOINTMENT_MINUTES,
+                    "timezone": str(_clinic_tz()),
+                    "summary": f"Appointment: {patient_name} — {reason_for_visit}",
+                    "description": (
+                        f"Confirmation: {confirmation}\n"
+                        f"Callback: {callback_number}\n"
+                        f"Booked by Maple voice assistant"
+                    ),
+                    "create_meeting_room": False,
+                }
+                if patient_email.strip():
+                    event_args["attendees"] = [patient_email.strip()]
+                    event_args["send_updates"] = "all"
+                event = execute_calendar_tool("GOOGLECALENDAR_CREATE_EVENT", event_args)
                 calendar_synced = True
                 logger.info(f"[scheduling] calendar event created for {confirmation}")
             except Exception as exc:

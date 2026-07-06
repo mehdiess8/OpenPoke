@@ -88,6 +88,24 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_agents",
+            "description": "Search the FULL execution-agent roster when the agent you need is not in your <active_agents> list. Always use this BEFORE creating a new agent for a task an existing agent may already own (e.g. an ongoing email thread).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What you're looking for, e.g. 'email thread with Alice about the invoice'.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Wait silently when a message is already in conversation history to avoid duplicating responses. Adds a <wait> log entry that is not visible to the user.",
             "parameters": {
@@ -120,8 +138,9 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
     existing_agents = set(roster.get_agents())
     is_new = agent_name not in existing_agents
 
-    if is_new:
-        roster.add_agent(agent_name)
+    # Creates with the first instructions as its description (selection feature),
+    # or refreshes last_active on reuse (recency signal).
+    roster.add_agent(agent_name, description=instructions)
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
@@ -198,6 +217,34 @@ def send_draft(
     )
 
 
+# Search the full roster semantically — the escape hatch for selection misses.
+# Every call is ALSO a logged signal that the injected top-k missed (free eval).
+def search_agents(query: str) -> ToolResult:
+    from ...services.execution.selection import score_agents
+
+    roster = get_agent_roster()
+    roster.load()
+    records = roster.get_records()
+    if not records:
+        return ToolResult(success=True, payload={"matches": []})
+
+    logger.warning(f"[selection] search_agents used — top-k miss signal for query: {query!r}")
+    try:
+        scored = score_agents(records, query, roster)[:8]
+        matches = [
+            {
+                "name": r["name"],
+                "description": r.get("description", ""),
+                "last_active": r.get("last_active"),
+            }
+            for r in scored
+        ]
+        return ToolResult(success=True, payload={"matches": matches})
+    except Exception as exc:
+        logger.error(f"search_agents failed: {exc}")
+        return ToolResult(success=False, payload={"error": str(exc)})
+
+
 # Record silent wait state to avoid duplicate responses
 def wait(reason: str) -> ToolResult:
     """Wait silently and add a wait log entry that is not visible to the user."""
@@ -242,6 +289,8 @@ def handle_tool_call(name: str, arguments: Any, channel: str = "text") -> ToolRe
             return send_draft(**args)
         if name == "wait":
             return wait(**args)
+        if name == "search_agents":
+            return search_agents(**args)
 
         intake_result = handle_intake_tool(name, args)
         if intake_result is not None:

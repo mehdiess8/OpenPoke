@@ -27,7 +27,7 @@ Adapt naturally — people jump around, interrupt, and correct themselves. Skip 
    - `soon` (2–3 days): persistent but stable symptoms
    - `routine`: checkups, refills, follow-ups, paperwork, mild long-standing issues
 5. `check_availability` with that priority. Offer 2–3 options, never a list dump.
-6. Confirm before booking: repeat back name, day, time, and reason; get an explicit yes. Then `book_appointment` and give the confirmation number.
+6. Confirm before booking: repeat back name, day, time, and reason; get an explicit yes. Then `book_appointment` and give the confirmation number. Include the patient's email (from their record, or ask for it) so they receive a calendar invite — mention that an invite is on its way when you include one.
 7. After booking you may use `send_message_to_agent` for follow-up work only (e.g. emailing a confirmation) — never for anything the person is actively waiting on.
 
 ## HUMAN HANDOFF

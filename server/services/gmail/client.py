@@ -28,16 +28,49 @@ def _normalized(value: Optional[str]) -> str:
     return (value or "").strip()
 
 
+_USER_ID_PATH = None  # set below once Path imports resolve
+
+
+def _user_id_file():
+    from pathlib import Path
+
+    global _USER_ID_PATH
+    if _USER_ID_PATH is None:
+        _USER_ID_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "gmail_user.json"
+    return _USER_ID_PATH
+
+
 def _set_active_gmail_user_id(user_id: Optional[str]) -> None:
     sanitized = _normalized(user_id)
     with _ACTIVE_USER_ID_LOCK:
         global _ACTIVE_USER_ID
         _ACTIVE_USER_ID = sanitized or None
+    # Persist so --reload restarts don't silently disconnect Gmail
+    # (the id previously lived in memory only).
+    try:
+        path = _user_id_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"user_id": sanitized}), encoding="utf-8")
+    except Exception as exc:
+        logger.warning(f"failed to persist gmail user id: {exc}")
 
 
 def get_active_gmail_user_id() -> Optional[str]:
     with _ACTIVE_USER_ID_LOCK:
-        return _ACTIVE_USER_ID
+        global _ACTIVE_USER_ID
+        if _ACTIVE_USER_ID:
+            return _ACTIVE_USER_ID
+    # Fall back to the persisted id after a server reload.
+    try:
+        path = _user_id_file()
+        if path.exists():
+            stored = json.loads(path.read_text(encoding="utf-8")).get("user_id") or None
+            if stored:
+                _set_active_gmail_user_id(stored)
+                return stored
+    except Exception as exc:
+        logger.warning(f"failed to load persisted gmail user id: {exc}")
+    return None
 
 
 def _gmail_import_client():

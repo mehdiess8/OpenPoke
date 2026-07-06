@@ -37,7 +37,7 @@ def prepare_message_with_history(
     sections: List[str] = []
 
     sections.append(_render_conversation_history(transcript))
-    sections.append(f"<active_agents>\n{_render_active_agents()}\n</active_agents>")
+    sections.append(f"<active_agents>\n{_render_active_agents(latest_text, channel)}\n</active_agents>")
     if emergency_alert:
         sections.append(f"<emergency_screen_alert>\n{emergency_alert}\n</emergency_screen_alert>")
     sections.append(_render_current_turn(latest_text, message_type, channel))
@@ -54,21 +54,48 @@ def _render_conversation_history(transcript: str) -> str:
     return f"<conversation_history>\n{history}\n</conversation_history>"
 
 
-# Format currently active execution agents into XML tags for LLM awareness
-def _render_active_agents() -> str:
+# Render the execution agents relevant to this turn (the agent-overload fix).
+# Small rosters are injected whole; past the threshold, semantic top-k +
+# recently-active agents are selected. Any failure falls back to the full
+# roster — correctness over efficiency.
+def _render_active_agents(latest_text: str = "", channel: str = "text") -> str:
+    from ...logging_config import logger
+    from ...services.execution.selection import (
+        SELECTION_THRESHOLD,
+        select_recent_agents,
+        select_relevant_agents,
+    )
+
     roster = get_agent_roster()
     roster.load()
-    agents = roster.get_agents()
+    records = roster.get_records()
 
-    if not agents:
+    if not records:
         return "None"
 
+    selected = records
+    note = ""
+    if len(records) > SELECTION_THRESHOLD and latest_text.strip():
+        try:
+            if channel == "voice":
+                # Voice pays for latency: recency-only selection, no embedding call.
+                selected = select_recent_agents(records)
+            else:
+                selected = select_relevant_agents(records, latest_text, roster)
+            note = (
+                f"\n<!-- showing {len(selected)} of {len(records)} agents most relevant to this "
+                "turn; use search_agents to find others -->"
+            )
+        except Exception as exc:
+            logger.warning(f"agent selection failed; injecting full roster: {exc}")
+            selected = records
+
     rendered: List[str] = []
-    for agent_name in agents:
-        name = escape(agent_name or "agent", quote=True)
+    for record in selected:
+        name = escape(record["name"] or "agent", quote=True)
         rendered.append(f'<agent name="{name}" />')
 
-    return "\n".join(rendered)
+    return "\n".join(rendered) + note
 
 
 # Wrap the current message in appropriate XML tags based on sender type

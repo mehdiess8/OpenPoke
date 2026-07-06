@@ -63,7 +63,9 @@ class Settings(BaseModel):
     composio_google_calendar_auth_config_id: Optional[str] = Field(
         default=os.getenv("COMPOSIO_GOOGLE_CALENDAR_AUTH_CONFIG_ID")
     )
+    clinic_calendar_id: str = Field(default=os.getenv("CLINIC_CALENDAR_ID", "primary"))
     composio_api_key: Optional[str] = Field(default=os.getenv("COMPOSIO_API_KEY"))
+    openai_api_key: Optional[str] = Field(default=os.getenv("OPENAI_API_KEY"))
 
     # HTTP behaviour
     cors_allow_origins_raw: str = Field(default=os.getenv("OPENPOKE_CORS_ALLOW_ORIGINS", "*"))

@@ -102,6 +102,46 @@ One assistant, two channels. The existing OpenPoke interaction agent is extended
 ### Parking lot additions
 - Better TTS voice: browser TTS sounds robotic — swap to OpenRouter/ElevenLabs TTS server-side; also consider better STT. Cascade boundaries are text, so this is frontend-only or a new `/voice/tts` endpoint.
 
+### Preference fix — "not offered" ≠ "unavailable"
+
+**Bug found by using the product:** caller asked "Tuesday at 4pm"; calendar had 0 busy ranges (4pm was free), but the tool's 4-slot spread sample didn't include it → agent truthfully reported its tool result but falsely told the caller the time was unavailable. Artificial scarcity presented as fact.
+
+**Fix (scheduling.py, deterministic + explainable):**
+- `_filter_by_preference()` — parses day names, morning/afternoon, "after N", "N am/pm" from the preference string; filters FREE slots to match
+- Preference matches → those slots offered (`note: matches caller's request`)
+- Preference understood but no free match → alternatives + explicit `note: genuinely unavailable` so the agent's phrasing stays truthful
+- Tool description updated: pass the caller's day/time request verbatim
+- Unit-tested: 'Tuesday at 4pm' / 'tuesday morning' / 'after 3pm' / 'wednesday' / 'whenever' all behave correctly
+
+**Q&A recorded (architecture clarification):** the agent is a hybrid — direct synchronous tools for on-call scheduling work (caller is waiting), OpenPoke-style async delegation to execution agents still available for background work (e.g. confirmation emails). Deliberate: "sync where a human waits, async where they don't."
+
+### Clinic calendar + patient invites
+
+- `CLINIC_CALENDAR_ID` (.env) — availability queries and event creation now target the dedicated Maple Clinic calendar (source of truth for the clinic's schedule), falling back to `primary`.
+- `book_appointment` gained `patient_email`: the event is created ON the clinic calendar with the patient as attendee (`send_updates: all`) — Google delivers an invite to the patient's calendar with RSVP. **Write once, invite — no two-calendar sync logic.**
+- Mock patient records now carry `email_on_file` (Mehdi's record uses his real email for the invite demo).
+
+### THE AGENT OVERLOAD FIX (implemented, not just discussed)
+
+The PRE-WORK topic, built with real embeddings:
+
+- `services/execution/roster.py` — records now carry name, description (seeded from first delegation instructions), created_at, last_active, cached embedding. Legacy bare-string rosters upgrade in place on load. `touch()` = recency signal on every reuse.
+- `services/embeddings.py` (NEW) — OpenAI `text-embedding-3-small` at **256 dims** (small cached vectors; brute-force cosine in pure Python is microseconds at roster scale — a vector DB would be slower than the network call to reach it).
+- `services/execution/selection.py` (NEW) — the layered selection: ① semantic top-6 (query embedding vs cached agent embeddings) ② ∪ recently-active (24h — covers semantic misses like "actually, cancel that") ③ cap 10 ④ lazy embedding backfill. **Any failure → full roster injection (correctness over efficiency).**
+- `agent.py::_render_active_agents(latest_text, channel)` — the overload site itself now selects. Rosters ≤10 inject whole (selection is pointless below threshold). Injects an HTML comment telling the model the list is filtered.
+- **Escape hatch:** `search_agents(query)` tool — full-roster semantic search when the expected agent isn't in the injected list. Every call is logged as a top-k miss signal = free retrieval eval. System prompt teaches: search before creating a new agent.
+- **Channel-aware latency:** the query-embedding call costs ~400-700ms. Text pays it (semantic selection); **voice uses recency-only selection (3ms, zero network)** — execution agents are rarely delegated mid-call, and dead air is worse than a slightly staler list.
+- `seed_roster.py` — seeds ~35 fake agents for the demo.
+- **Measured:** 36-agent roster → 6 injected; text 426ms (semantic), voice 3ms (recency).
+- **Live demo of the designed failure mode:** query "did alice reply about the invoice?" ranked 6 other invoice agents above "Weekly report to Alice" (rank 7, outside top-6) — near-topic agents dominate name matches. Exactly why the escape hatch + description-based embeddings exist.
+- ⚠ Demo note: `DELETE /chat/history` clears the roster — re-run `seed_roster.py` after a reset if demoing the overload fix.
+
+### Gmail disconnect-on-reload fix (found via overload-fix testing)
+
+- **Bug:** Gmail's connected user id lived in memory only (`_ACTIVE_USER_ID`) — every `--reload` (dozens today) silently disconnected Gmail. Same class of bug we pre-empted in `calendar_client.py` by persisting connection state.
+- **Fix:** persist to `server/data/gmail_user.json` on set; fall back to the file on read after a reload. One-time reconnect required to seed the file.
+- **The gold in the same logs:** the overload-fix loop ran end-to-end UNPROMPTED — selection injected 6 invoice agents (Alice ranked 7th, missed) → model called `search_agents` (miss signal logged) → found and REUSED the existing Alice agent instead of creating a duplicate → delegated the email search. Design validated by the model's own behavior 3 minutes after being built.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:
