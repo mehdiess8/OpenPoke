@@ -213,6 +213,16 @@ Motivation: even lower latency + natural prosody (model hears audio directly). K
 - **defer_task (capability-gap escape valve, from field testing):** caller asked the voice agent to send an email → it refused and offered a human. Fix: a 7th tool — anything outside the call tools gets queued ("I can take care of that after the call — you'll get a text") onto the same outstanding list. On hang-up the interaction agent's NORMAL pipeline handles it (e.g. delegates the email to an execution agent → real Gmail send → outcome in chat). Transfers now reserved for safety cases only. Full relay: voice session → persistent agent → execution agent → Gmail.
 - Also this morning: sidecar transcription switched to `gpt-realtime-whisper` (the natively-streaming model intended for realtime sessions); README gained the OpenAI Agents SDK migration path — notably OpenAI's own docs recommend the chained pipeline for "approval-heavy flows / durable transcripts," independently confirming the v2-for-clinics call.
 
+### Safety audit (day 2, prompted by Mehdi: "if I asked the agent to do something bad?")
+
+**Layers in place:** capability confinement (7 tools, model narrates / tools decide, everything audit-logged) · deterministic emergency guard · scope rules (no diagnosis, sensitive→human) · output contract · draft-confirmation human-in-the-loop for outbound email · inherited model refusals.
+
+**Gaps found & fixed:**
+- `lookup_appointments` disclosed appointment times + reasons (PHI) on a NAME ALONE. Now identity-gated: DOB must match the patient record (normalized to YYYY-MM-DD by the model; deny-by-default, denials logged). Tested: no-DOB/wrong-DOB denied, match discloses.
+- `defer_task` bridged an unauthenticated caller to the interaction agent's full capabilities (incl. Gmail). The handoff message now flags items as weakly-verified caller requests: apply normal judgment + draft-confirmation, decline anything inappropriate/suspicious/out-of-scope.
+
+**Known residual risks (honest list for the walkthrough):** name+DOB is weak verification (same as most real clinics' phone flows — production wants callback-number matching or patient-portal auth) · voice prompt injection (caller speaking instructions) is mitigated by capability confinement + deterministic guards, not eliminated · PHI in plaintext flat files is demo-only · no rate limiting / abuse-pattern detection on bookings.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:

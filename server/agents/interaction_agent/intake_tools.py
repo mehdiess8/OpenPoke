@@ -69,13 +69,14 @@ INTAKE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "lookup_appointments",
-            "description": "List a patient's existing booked appointments (date, time, confirmation number). ALWAYS use this for questions like 'when is my appointment' or 'what bookings do I have' — never search email or delegate to agents for booking records.",
+            "description": "List a patient's existing booked appointments (date, time, confirmation number). ALWAYS use this for questions like 'when is my appointment' or 'what bookings do I have' — never search email or delegate to agents for booking records. Identity-gated: requires the patient's date of birth.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "patient_name": {"type": "string", "description": "Patient full name."},
+                    "date_of_birth": {"type": "string", "description": "Patient date of birth in YYYY-MM-DD format, for identity verification before disclosing appointment details."},
                 },
-                "required": ["patient_name"],
+                "required": ["patient_name", "date_of_birth"],
                 "additionalProperties": False,
             },
         },

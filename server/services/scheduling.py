@@ -370,8 +370,22 @@ def book_appointment(
     return result
 
 
-def lookup_appointments(patient_name: str) -> Dict[str, Any]:
-    """List a patient's booked appointments from the clinic's booking records."""
+def lookup_appointments(patient_name: str, date_of_birth: str = "") -> Dict[str, Any]:
+    """List a patient's booked appointments — identity-gated.
+
+    Appointment times and reasons-for-visit are PHI: require a DOB match
+    against the patient record before disclosing anything.
+    """
+    record = _MOCK_PATIENTS.get(patient_name.strip().lower())
+    if record is not None:
+        provided = "".join(c for c in date_of_birth if c.isdigit())
+        on_file = "".join(c for c in record["date_of_birth"] if c.isdigit())
+        if not provided or provided != on_file:
+            logger.warning(f"[scheduling] appointment lookup DENIED for {patient_name} (DOB mismatch/missing)")
+            return {
+                "error": "Identity not verified. Ask for the patient's date of birth, convert it to YYYY-MM-DD, and try again — do not disclose any appointment details until it matches."
+            }
+
     if not _BOOKINGS_PATH.exists():
         return {"appointments": [], "message": "No bookings on file."}
     try:
