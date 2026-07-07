@@ -1,13 +1,17 @@
 'use client';
 
 /**
- * Voice v2 — native UI over the Pipecat media worker.
+ * Voice v3 UI — speech-to-speech call with an orb, not a chat transcript.
  *
- * PipecatClient (WebRTC) connects to the voice worker via the /voice-worker
- * Next.js rewrite (same-origin, no CORS). The transcript renders from SDK
- * events: onUserTranscript (interim + final) and onBotTtsText — which emits
- * words AS THEY ARE SPOKEN, so the screen never shows unspoken text and
- * barge-in truncation is visually accurate by construction.
+ * Design rationale: in the Realtime (s2s) architecture the user-side
+ * transcript is a SIDECAR approximation (a separate transcription model —
+ * the realtime model consumes raw audio and never sees that text). Rendering
+ * it as authoritative chat bubbles misrepresents the system. So: no user
+ * text on screen. The orb reflects the conversation state, and the agent's
+ * spoken words roll beneath it as they are said (onBotTtsText).
+ *
+ * The sidecar transcription stays ENABLED in the pipeline — it feeds the
+ * deterministic red-flag guard and the caller side of the post-call recap.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -15,38 +19,24 @@ import { PipecatClient, TransportState } from '@pipecat-ai/client-js';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
 
 type CallStatus = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'ended';
-type Turn = { role: 'caller' | 'assistant'; text: string };
 
 export default function CallV2Page() {
   const [status, setStatus] = useState<CallStatus>('idle');
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const [interim, setInterim] = useState('');
-  const [liveBot, setLiveBot] = useState('');
+  const [stream, setStream] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const clientRef = useRef<PipecatClient | null>(null);
-  const liveBotRef = useRef('');
   const inCallRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const streamEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [turns, interim, liveBot]);
-
-  const commitBotTurn = useCallback(() => {
-    const text = liveBotRef.current.trim();
-    if (text) setTurns((prev) => [...prev, { role: 'assistant', text }]);
-    liveBotRef.current = '';
-    setLiveBot('');
-  }, []);
+    streamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [stream]);
 
   const startCall = useCallback(async () => {
     setError(null);
-    setTurns([]);
-    setInterim('');
-    liveBotRef.current = '';
-    setLiveBot('');
+    setStream('');
     setStatus('connecting');
     inCallRef.current = true;
 
@@ -67,39 +57,19 @@ export default function CallV2Page() {
         onTransportStateChanged: (state: TransportState) => {
           if (state === 'error') setError('Connection error — is the voice worker running on :7860?');
         },
-        onUserTranscript: (data: any) => {
-          if (data?.final) {
-            const text = (data.text || '').trim();
-            if (text) setTurns((prev) => [...prev, { role: 'caller', text }]);
-            setInterim('');
-            setStatus('thinking');
-          } else {
-            setInterim(data?.text || '');
-          }
-        },
-        onUserStartedSpeaking: () => {
-          // Barge-in: freeze the bot bubble at the words actually spoken.
-          if (liveBotRef.current) {
-            liveBotRef.current = `${liveBotRef.current.trim()} —`;
-            commitBotTurn();
-          }
-          setStatus('listening');
-        },
-        onBotTtsText: (data: any) => {
-          // Words arrive as they are spoken — append to the live bubble.
-          const word = data?.text || '';
-          liveBotRef.current = liveBotRef.current ? `${liveBotRef.current} ${word}` : word;
-          setLiveBot(liveBotRef.current);
-        },
+        onUserStartedSpeaking: () => setStatus('listening'),
+        onUserStoppedSpeaking: () => setStatus('thinking'),
         onBotStartedSpeaking: () => setStatus('speaking'),
         onBotStoppedSpeaking: () => {
-          commitBotTurn();
           if (inCallRef.current) setStatus('listening');
+        },
+        onBotTtsText: (data: any) => {
+          const word = (data?.text || '').trim();
+          if (word) setStream((prev) => (prev ? `${prev} ${word}` : word));
         },
       },
     });
 
-    // Play the bot's audio track through our own <audio> element.
     client.on('trackStarted', (track: MediaStreamTrack, participant: any) => {
       if (!participant?.local && track.kind === 'audio' && audioRef.current) {
         audioRef.current.srcObject = new MediaStream([track]);
@@ -115,12 +85,10 @@ export default function CallV2Page() {
       setStatus('idle');
       inCallRef.current = false;
     }
-  }, [commitBotTurn]);
+  }, []);
 
   const hangUp = useCallback(async () => {
     inCallRef.current = false;
-    commitBotTurn();
-    setInterim('');
     setStatus('ended');
     try {
       await clientRef.current?.disconnect();
@@ -128,7 +96,7 @@ export default function CallV2Page() {
       /* already closing */
     }
     clientRef.current = null;
-  }, [commitBotTurn]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -137,36 +105,46 @@ export default function CallV2Page() {
     };
   }, []);
 
-  const statusLabel: Record<CallStatus, string> = {
-    idle: 'Ready to call',
-    connecting: 'Connecting…',
-    listening: 'Listening…',
-    thinking: 'Thinking…',
-    speaking: 'Speaking',
-    ended: 'Call ended — recap sent to your chat',
+  const orbClass: Record<CallStatus, string> = {
+    idle: 'scale-90 bg-gradient-to-br from-gray-200 to-gray-300',
+    connecting: 'scale-95 bg-gradient-to-br from-amber-200 to-amber-300 orb-breathe',
+    listening: 'scale-100 bg-gradient-to-br from-emerald-300 to-teal-400 orb-breathe',
+    thinking: 'scale-95 bg-gradient-to-br from-amber-300 to-orange-400 orb-breathe-fast',
+    speaking: 'scale-110 bg-gradient-to-br from-blue-400 to-indigo-500 orb-talk',
+    ended: 'scale-90 bg-gradient-to-br from-gray-300 to-gray-400',
   };
 
-  const statusColor: Record<CallStatus, string> = {
-    idle: 'bg-gray-300',
-    connecting: 'bg-amber-400 animate-pulse',
-    listening: 'bg-green-500 animate-pulse',
-    thinking: 'bg-amber-400 animate-pulse',
-    speaking: 'bg-blue-500 animate-pulse',
-    ended: 'bg-gray-400',
+  const statusLabel: Record<CallStatus, string> = {
+    idle: 'Tap to call Maple Family Clinic',
+    connecting: 'Connecting…',
+    listening: 'Listening',
+    thinking: 'Thinking…',
+    speaking: 'Maple is speaking',
+    ended: 'Call ended — recap sent to your chat',
   };
 
   return (
     <main className="mx-auto flex min-h-screen max-w-2xl flex-col p-6">
+      <style>{`
+        @keyframes orbBreathe {
+          0%, 100% { transform: scale(1); }
+          50% { transform: scale(1.05); }
+        }
+        @keyframes orbTalk {
+          0%, 100% { transform: scale(1.06); border-radius: 48% 52% 51% 49%; }
+          25% { transform: scale(1.14); border-radius: 52% 48% 49% 51%; }
+          50% { transform: scale(1.02); border-radius: 50% 50% 52% 48%; }
+          75% { transform: scale(1.12); border-radius: 49% 51% 48% 52%; }
+        }
+        .orb-breathe { animation: orbBreathe 3s ease-in-out infinite; }
+        .orb-breathe-fast { animation: orbBreathe 1.1s ease-in-out infinite; }
+        .orb-talk { animation: orbTalk 0.9s ease-in-out infinite; }
+      `}</style>
+
       <audio ref={audioRef} autoPlay hidden />
 
       <header className="mb-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="text-lg font-semibold">Maple Family Clinic 📞</h1>
-          <span className="flex items-center gap-2 text-sm text-gray-500">
-            <span className={`h-2.5 w-2.5 rounded-full ${statusColor[status]}`} />
-            {statusLabel[status]}
-          </span>
-        </div>
+        <h1 className="text-lg font-semibold">Maple Family Clinic 📞</h1>
         <div className="flex items-center gap-2">
           <a href="/call" className="rounded-md border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50">
             Classic mode
@@ -183,41 +161,20 @@ export default function CallV2Page() {
         </div>
       )}
 
-      <div className="flex-1 space-y-3 overflow-y-auto rounded-lg border border-gray-200 bg-white p-4">
-        {turns.length === 0 && status === 'idle' && (
-          <p className="py-12 text-center text-sm text-gray-400">
-            Tap Start Call and speak — streaming voice, no headphones needed.
-          </p>
-        )}
-        {turns.map((turn, i) => (
-          <div key={i} className={`flex ${turn.role === 'caller' ? 'justify-end' : 'justify-start'}`}>
-            <div
-              className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm ${
-                turn.role === 'caller' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-900'
-              }`}
-            >
-              {turn.text}
-            </div>
-          </div>
-        ))}
-        {liveBot && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-2xl bg-gray-100 px-4 py-2 text-sm text-gray-900">
-              {liveBot}
-            </div>
-          </div>
-        )}
-        {interim && (
-          <div className="flex justify-end">
-            <div className="max-w-[80%] rounded-2xl bg-blue-200 px-4 py-2 text-sm italic text-blue-900">
-              {interim}
-            </div>
-          </div>
-        )}
-        <div ref={transcriptEndRef} />
-      </div>
+      <div className="flex flex-1 flex-col items-center justify-center gap-8">
+        <button
+          onClick={status === 'idle' || status === 'ended' ? startCall : hangUp}
+          className={`h-44 w-44 rounded-full shadow-xl transition-all duration-500 ${orbClass[status]}`}
+          aria-label={status === 'idle' || status === 'ended' ? 'Start call' : 'Hang up'}
+        />
 
-      <div className="mt-4 flex justify-center gap-3">
+        <p className="text-sm font-medium text-gray-500">{statusLabel[status]}</p>
+
+        <div className="relative h-32 w-full max-w-lg overflow-y-auto px-4 [mask-image:linear-gradient(to_bottom,transparent,black_30%)]">
+          <p className="text-center text-sm leading-6 text-gray-600">{stream}</p>
+          <div ref={streamEndRef} />
+        </div>
+
         {status === 'idle' || status === 'ended' ? (
           <button
             onClick={startCall}
