@@ -169,6 +169,23 @@ Explored replacing the robotic browser voice with OpenRouter's `/audio/speech` e
 - Fixes: `lookup_appointments(patient_name)` tool reading the clinic's booking records (single source of truth); prompt rules — never search email or delegate for booking records; tool failures are momentary, re-attempt before claiming something is broken.
 - Lesson for the walkthrough: agents fail by IMPROVISING around capability gaps — the fix is completing the tool surface for the real user journeys (book → recall → [cancel/reschedule: future]), not punishing the improvisation.
 
+### The voice architecture saga (evening of day 1) — three implementations, one lesson
+
+**v1 — hand-rolled browser loop** (Chrome SpeechRecognition + speechSynthesis + /voice/send): worked, but four field problems: self-interruption on speakers (mic hears TTS, no AEC), register bleed (voice agent narrating text-style — history is text-register), robotic voice, dead air (~1s Chrome endpointing + 2–6s full agent turn before any audio).
+
+**Framework research:** Pipecat (OSS, P2P WebRTC, VAD, streaming) vs LiveKit (same class, needs media server) vs Vapi/Retell (hosted, bring-your-own-LLM). Key analysis: the dominant latency was OUR full-turn agent (2–6s), which no framework removes — frameworks fix echo (WebRTC AEC), endpointing (Silero), and streaming plumbing.
+
+**v2 — voice-native streaming agent on Pipecat (feature/pipecat-voice) — THE FIX.** Mehdi's architectural insight: a call is a SESSION; it doesn't need the persistent runtime in the loop. Per-call agent with injected context (voice persona + intake/safety rules + memory tail), streaming end-to-end: OpenAI realtime STT → streaming LLM via OpenRouter → streaming TTS. Same clinic stack reused in-process (intake tool schemas as pipecat function handlers, red-flag guard on transcripts, recap posted to main chat on disconnect). Result in field test: "voice felt human, delay much smaller" — all four v1 problems resolved.
+
+- Media worker (:7860) is a deliberately SEPARATE process: media plane (10ms audio frames, VAD inference, live websockets) vs control plane (request/response app on :8001, --reload restarts would kill live calls). Standard voice-platform architecture.
+- Custom in-app call UI (/call-v2) on @pipecat-ai/client-js: own transcript bubbles; bot text renders word-by-word AS SPOKEN (onBotTtsText) — the "never show unspoken words" property by construction; barge-in freezes the bubble at the cutoff. Signaling proxied via Next rewrite (same-origin). Classic v1 retained at /call.
+
+**Discipline notes for the walkthrough:** browser-TTS-upgrade (OpenRouter kokoro) was built, measured, and REVERTED on UX evidence; the framework switch only happened after latency analysis showed which problems it would and wouldn't fix; v1 remains demoable as the from-scratch implementation.
+
+### v3 experiment — OpenAI Realtime speech-to-speech (branch: feature/openai-realtime-voice)
+
+Motivation: even lower latency + natural prosody (model hears audio directly). Known tradeoff going in (from prep + relevant to a medical/insurance context): NO inspectable text layer between stages — weaker audit/compliance story than the cascade; tools work but via the provider's protocol. Plan: pipecat's OpenAI Realtime service in the same pipeline slot, same tool schemas, same recap-from-context on disconnect. Timeboxed experiment — cascade v2 remains the primary demo.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:
