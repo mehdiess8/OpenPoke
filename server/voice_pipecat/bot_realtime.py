@@ -43,17 +43,19 @@ from server.voice_pipecat.bot import (
     _build_system_prompt,
     _make_tools,
     _post_call_recap,
+    _report_outstanding,
 )
 
 load_dotenv(override=True)
 
 
 async def run_bot(transport, handle_sigint: bool = False):
+    outstanding: list = []
     llm = OpenAIRealtimeLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         session_properties=SessionProperties(
             instructions=_build_system_prompt(),
-            tools=_make_tools(),
+            tools=_make_tools(outstanding),
             tool_choice="auto",
             # Caller-audio transcription is OFF by default in the Realtime API.
             # We need it for: user bubbles in the UI, the deterministic
@@ -66,7 +68,11 @@ async def run_bot(transport, handle_sigint: bool = False):
             # two architectures.
             audio=AudioConfiguration(
                 input=AudioInput(
-                    transcription=InputAudioTranscription(model="gpt-4o-transcribe")
+                    # gpt-realtime-whisper is the natively-streaming transcription
+                    # model intended for realtime sessions (gpt-4o-transcribe is
+                    # for file/request-response workflows). Still a sidecar:
+                    # the realtime model consumes raw audio, never this text.
+                    transcription=InputAudioTranscription(model="gpt-realtime-whisper")
                 ),
             ),
         ),
@@ -112,6 +118,7 @@ async def run_bot(transport, handle_sigint: bool = False):
             await _post_call_recap(context)
         except Exception as exc:
             logger.warning(f"[voice-realtime] recap failed: {exc}")
+        await _report_outstanding(outstanding)
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=handle_sigint)

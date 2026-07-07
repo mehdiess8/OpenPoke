@@ -15,9 +15,13 @@ Latency win over v1: the LLM leg streams — first sentence reaches TTS while th
 model is still writing, instead of waiting for the full agent turn.
 """
 
+import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import httpx
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -64,6 +68,8 @@ You: Sorry to hear that — how long has your back been bothering you?
 Caller: Can I come in tomorrow morning?
 You: Let me take a look. One moment.
 You: I have nine twenty or ten forty tomorrow morning. Which works better?
+
+If the caller asks for something OUTSIDE your call tools — sending an email, paperwork, prescription questions for the doctor, anything you cannot do on this call — do NOT refuse and do NOT transfer to a human for that reason alone. Use the defer_task tool and tell them naturally: "I can take care of that after the call — you'll get a text with the outcome." The clinic assistant completes deferred tasks after the call ends. Transfers to a human remain for the safety cases only (caller asks for a person, emergencies, sensitive situations, repeated confusion).
 """
 
 
@@ -86,16 +92,48 @@ def _build_system_prompt() -> str:
     return f"{_PERSONA}\n\n{scheduling_rules}{memory_tail}"
 
 
-def _make_tools() -> ToolsSchema:
-    """Reuse the existing intake tool schemas; handlers call the clinic services in-process."""
+_TOOL_TIMEOUT_SECS = 20.0
+
+_FOLLOWUP_NOTE = (
+    "Tell the caller this is taking too long to complete right now, and that "
+    "you will finish it and follow up with them by text message shortly. "
+    "Do not retry on this call. Continue helping with anything else."
+)
+
+
+def _make_tools(outstanding: Optional[List[Dict[str, Any]]] = None) -> ToolsSchema:
+    """Reuse the existing intake tool schemas; handlers call the clinic services in-process.
+
+    Tool calls are bounded (_TOOL_TIMEOUT_SECS). On timeout or crash the model
+    is told to promise a text follow-up, and the item is recorded on the
+    per-call `outstanding` list — handed to the persistent text agent on
+    hang-up to complete asynchronously. Sync where a human waits, async where
+    they don't — including the recovery path.
+    """
 
     def make_handler(tool_name: str):
         async def handler(params: FunctionCallParams):
-            logger.info(f"[voice-native] tool: {tool_name}({params.arguments})")
+            args = params.arguments or {}
+            logger.info(f"[voice-native] tool: {tool_name}({args})")
             try:
-                result = handle_intake_tool(tool_name, params.arguments or {})
+                if os.getenv("SIMULATE_TOOL_FAILURE") == tool_name:
+                    raise RuntimeError("simulated tool failure (SIMULATE_TOOL_FAILURE)")
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(handle_intake_tool, tool_name, args),
+                    timeout=_TOOL_TIMEOUT_SECS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[voice-native] tool timed out: {tool_name}")
+                if outstanding is not None:
+                    outstanding.append(
+                        {"tool": tool_name, "arguments": args, "problem": f"timed out after {_TOOL_TIMEOUT_SECS:.0f}s"}
+                    )
+                result = {"error": "This is taking too long.", "note": _FOLLOWUP_NOTE}
             except Exception as exc:
-                result = {"error": str(exc)}
+                logger.warning(f"[voice-native] tool failed: {tool_name}: {exc}")
+                if outstanding is not None:
+                    outstanding.append({"tool": tool_name, "arguments": args, "problem": str(exc)})
+                result = {"error": str(exc), "note": _FOLLOWUP_NOTE}
             await params.result_callback(result)
 
         return handler
@@ -112,6 +150,37 @@ def _make_tools() -> ToolsSchema:
                 handler=make_handler(fn["name"]),
             )
         )
+
+    # defer_task: the capability-gap escape valve. Anything the voice agent
+    # can't do on-call gets queued and handed to the persistent text agent on
+    # hang-up (same channel as failed/timed-out tools).
+    async def defer_task_handler(params: FunctionCallParams):
+        description = (params.arguments or {}).get("description", "").strip()
+        logger.info(f"[voice-native] task deferred to after the call: {description!r}")
+        if outstanding is not None and description:
+            outstanding.append({"task": description, "problem": "requested by caller; outside call capabilities"})
+        await params.result_callback(
+            {
+                "queued": bool(description),
+                "note": "Tell the caller you'll take care of it after the call and they'll receive a text with the outcome.",
+            }
+        )
+
+    functions.append(
+        FunctionSchema(
+            name="defer_task",
+            description="Queue a task the caller requested that you cannot do on this call (emails, paperwork, messages to the doctor, anything outside your call tools). It will be completed after the call and the caller texted the outcome.",
+            properties={
+                "description": {
+                    "type": "string",
+                    "description": "The task, specific and self-contained, including any details the caller provided (recipients, content, context).",
+                }
+            },
+            required=["description"],
+            handler=defer_task_handler,
+        )
+    )
+
     return ToolsSchema(standard_tools=functions)
 
 
@@ -170,6 +239,20 @@ async def _post_call_recap(context: LLMContext) -> None:
     logger.info("[voice-native] recap posted to chat")
 
 
+# Hand unresolved call work to the persistent text agent for async completion.
+async def _report_outstanding(outstanding: List[Dict[str, Any]]) -> None:
+    if not outstanding:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(
+                f"{OPENPOKE_BASE}/api/v1/voice/followup", json={"items": outstanding}
+            )
+        logger.info(f"[voice-native] handed {len(outstanding)} outstanding item(s) to the text agent")
+    except Exception as exc:
+        logger.error(f"[voice-native] failed to hand off outstanding items: {exc}")
+
+
 async def run_bot(transport, handle_sigint: bool = False):
     settings = get_settings()
 
@@ -182,9 +265,10 @@ async def run_bot(transport, handle_sigint: bool = False):
         model=os.getenv("OPENPOKE_VOICE_MODEL", settings.interaction_agent_model),
     )
 
+    outstanding: List[Dict[str, Any]] = []
     context = LLMContext(
         messages=[{"role": "system", "content": _build_system_prompt()}],
-        tools=_make_tools(),
+        tools=_make_tools(outstanding),
     )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
@@ -220,6 +304,7 @@ async def run_bot(transport, handle_sigint: bool = False):
             await _post_call_recap(context)
         except Exception as exc:
             logger.warning(f"[voice-native] recap failed: {exc}")
+        await _report_outstanding(outstanding)
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=handle_sigint)

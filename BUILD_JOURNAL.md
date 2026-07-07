@@ -186,6 +186,33 @@ Explored replacing the robotic browser voice with OpenRouter's `/audio/speech` e
 
 Motivation: even lower latency + natural prosody (model hears audio directly). Known tradeoff going in (from prep + relevant to a medical/insurance context): NO inspectable text layer between stages — weaker audit/compliance story than the cascade; tools work but via the provider's protocol. Plan: pipecat's OpenAI Realtime service in the same pipeline slot, same tool schemas, same recap-from-context on disconnect. Timeboxed experiment — cascade v2 remains the primary demo.
 
+### v3 results — OpenAI Realtime s2s (field-tested ~1:30am)
+
+- **Verdict: "by far the best working solution"** — lowest latency, most natural prosody. Tools, greeting, recap all worked through the same reused stack (~120 new lines; everything else imported from v2).
+- **Bug found & fixed:** Realtime API does NOT transcribe caller audio by default — user bubbles empty, and (critically) the red-flag guard was blind and the recap lost the caller side. Fix: enable `InputAudioTranscription` explicitly (upgraded to `gpt-4o-transcribe`).
+- **THE DISCOVERY:** even enabled, the caller transcript is a SIDECAR — a separate transcription model on the same audio; the realtime model consumes raw audio and never sees that text. Mehdi observed transcript ≠ what the model clearly understood. **In the cascade, the transcript IS the model input (single source of truth); in s2s the audit log is an approximation of what the model processed.** The compliance tradeoff we documented from theory, demonstrated empirically in our own product.
+- **Orb UI (design honesty):** v3's /call-v2 replaces chat bubbles with a ChatGPT-voice-style orb (breathing = listening, morphing blob = speaking) + the agent's words rolling beneath as spoken. No user text on screen — because in s2s it isn't the truth. Sidecar transcription stays enabled in the pipeline for the guard + recap. Each branch's UI now tells the truth about its architecture: bubbles where transcript = source of truth (v2), orb where it isn't (v3).
+
+**Final state: three voice architectures on three branches, one shared brain-stack, one web UI.**
+| | v1 hand-rolled | v2 streaming cascade | v3 realtime s2s |
+|---|---|---|---|
+| Branch | feature/voice-intake-agent | feature/pipecat-voice | feature/openai-realtime-voice |
+| Latency | worst (full-turn wait) | good (streaming overlap) | best |
+| Voice quality | robotic | natural (OpenAI TTS) | most natural (prosody-aware) |
+| Speaker echo | vulnerable (heuristics) | solved (WebRTC AEC) | solved (WebRTC AEC) |
+| Audit/text layer | full (transcript = input) | full (transcript = input) | sidecar approximation |
+| Cost/min | lowest | low | ~10x cascade |
+| Production pick for a clinic | teaching artifact | **RECOMMENDED** | frontier option, compliance caveat |
+
+### Async follow-up for failed/slow call tasks (the closing loop)
+
+- Tool calls in the voice workers are now bounded (20s) and failure-aware: on timeout/crash the model is instructed to promise a text follow-up (no dead air, no on-call retry loops), and the item is recorded on a per-call outstanding list.
+- On hang-up, outstanding items POST to `/voice/followup`, which delivers them to the interaction agent as a **plain agent message via handle_agent_message — the normal pipeline, no scaffolding** (Mehdi's correction: don't prescribe tool usage; the agent's standard routing/delegation decides). It completes the work and messages the user the outcome in chat.
+- This completes the architecture's thesis: sync where a human waits, async where they don't — INCLUDING the recovery path. Voice session → persistent agent handoff is the same direction as call recaps, now carrying work, not just memory.
+- `SIMULATE_TOOL_FAILURE=<tool>` env var = live failure-injection lever for demos/testing.
+- **defer_task (capability-gap escape valve, from field testing):** caller asked the voice agent to send an email → it refused and offered a human. Fix: a 7th tool — anything outside the call tools gets queued ("I can take care of that after the call — you'll get a text") onto the same outstanding list. On hang-up the interaction agent's NORMAL pipeline handles it (e.g. delegates the email to an execution agent → real Gmail send → outcome in chat). Transfers now reserved for safety cases only. Full relay: voice session → persistent agent → execution agent → Gmail.
+- Also this morning: sidecar transcription switched to `gpt-realtime-whisper` (the natively-streaming model intended for realtime sessions); README gained the OpenAI Agents SDK migration path — notably OpenAI's own docs recommend the chained pipeline for "approval-heavy flows / durable transcripts," independently confirming the v2-for-clinics call.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:

@@ -12,8 +12,10 @@ the model converses — conservative and explainable by design.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter
@@ -159,6 +161,42 @@ async def voice_interrupted(payload: InterruptionRequest) -> JSONResponse:
     session.record_interruption(payload.heard)
     logger.info(f"[voice] barge-in recorded (heard {len(payload.heard.strip())} chars)")
     return JSONResponse({"ok": True})
+
+
+class FollowupRequest(BaseModel):
+    items: List[Dict[str, Any]] = []
+
+
+@router.post("/followup", response_class=JSONResponse, summary="Hand unresolved call tasks to the text agent")
+# Failed/timed-out call tasks are delivered to the interaction agent as a
+# normal agent message — its standard pipeline (routing, delegation or its
+# own tools, reply to the user) takes it from there. No special scaffolding.
+async def voice_followup(payload: FollowupRequest) -> JSONResponse:
+    if not payload.items:
+        return JSONResponse({"ok": True, "detail": "Nothing outstanding."})
+
+    lines = []
+    for item in payload.items:
+        if item.get("task"):
+            lines.append(f"- caller request: {item['task']}")
+        else:
+            lines.append(
+                f"- {item.get('tool', 'unknown')}({json.dumps(item.get('arguments', {}))[:200]}) — {item.get('problem', 'unknown problem')}"
+            )
+    message = (
+        "Voice call assistant: the call just ended with unfinished business. The following "
+        "could not be completed during the call, and the caller was told we would follow "
+        "up by text:\n" + "\n".join(lines)
+    )
+
+    try:
+        runtime = InteractionAgentRuntime()
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    logger.info(f"[voice] {len(payload.items)} outstanding item(s) handed to the text agent")
+    asyncio.create_task(runtime.handle_agent_message(message))
+    return JSONResponse({"ok": True, "items": len(payload.items)})
 
 
 @router.post("/end", response_class=JSONResponse, summary="End the active call and post a recap to the chat")
