@@ -11,7 +11,7 @@ export function ChatHeader({ onOpenSettings, onClearHistory }: ChatHeaderProps) 
       </div>
       <div className="flex items-center gap-2">
         <a
-          href="/call"
+          href="/call-v2"
           className="rounded-md border border-gray-200 px-3 py-2 text-sm hover:bg-gray-50"
         >
           📞 Call

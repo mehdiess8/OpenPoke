@@ -11,6 +11,18 @@ const { loadEnvConfig } = envPackage;
 loadEnvConfig?.(repoRoot, isDevelopment);
 
 /** @type {import('next').NextConfig} */
-const nextConfig = {};
+const nextConfig = {
+  // Proxy WebRTC signaling to the Pipecat voice worker (:7860) so the browser
+  // talks same-origin (no CORS) and the worker URL stays server-side config.
+  async rewrites() {
+    const voiceWorker = process.env.VOICE_WORKER_URL || 'http://localhost:7860';
+    return [
+      {
+        source: '/voice-worker/:path*',
+        destination: `${voiceWorker.replace(/\/$/, '')}/:path*`,
+      },
+    ];
+  },
+};
 
 export default nextConfig;
