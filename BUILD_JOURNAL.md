@@ -142,6 +142,33 @@ The PRE-WORK topic, built with real embeddings:
 - **Fix:** persist to `server/data/gmail_user.json` on set; fall back to the file on read after a reload. One-time reconnect required to seed the file.
 - **The gold in the same logs:** the overload-fix loop ran end-to-end UNPROMPTED — selection injected 6 invoice agents (Alice ranked 7th, missed) → model called `search_agents` (miss signal logged) → found and REUSED the existing Alice agent instead of creating a duplicate → delegated the email search. Design validated by the model's own behavior 3 minutes after being built.
 
+### Server-side TTS: built, measured, REJECTED (kept as optional backend)
+
+Explored replacing the robotic browser voice with OpenRouter's `/audio/speech` endpoint (mirrors OpenAI's API):
+- Discovered available models by querying the models API (`output_modalities=speech`) after the docs' example slug 404'd; probed provider-specific voice conventions (Azure needs full neural voice names like `en-US-Ava:DragonHDLatestNeural`; Gemini TTS only outputs PCM; `voice` is required)
+- Measured: `kokoro-82m`/`af_heart` 0.4–0.8s per sentence (cheapest), `mai-voice-2` DragonHD ~1.2s (premium)
+- Implemented the production pattern: sentence-chunk queueing with pipelined synthesis (Pipecat/LiveKit style) + sentence-precise heard-tracking for barge-in
+- **Verdict after live testing: worse call UX than browser TTS.** Gaps between sentence chunks + slower time-to-first-audio beat the quality gain. Instant-robotic > natural-laggy — the latency-is-the-product thesis validated against our own feature.
+- Kept: `POST /voice/tts` endpoint + `OPENPOKE_TTS_MODEL`/`OPENPOKE_TTS_VOICE` config (working, tested) for a future streaming implementation; frontend defaults to browser TTS with exact word-level `onboundary` tracking.
+- Production path (README material): true streaming TTS over websocket (ElevenLabs Flash / Deepgram Aura) with character-level timestamps — removes both the gaps and the tracking estimate. The heard-chars interface we built is provider-agnostic either way.
+
+### Voice output contract (robustness at any context length)
+
+**Incident:** after ~100+ messages of accumulated test history, the agent began narrating internal plans ("Starting intake - need to understand reason for visit...") instead of replying. Root-cause candidates: long/summarized history steering the model's register (A/B: clearing history restored behavior — n=1, mechanism unverified; evidence lost to a failed backup, owned in review). **Mehdi's design challenge: the system must work with 100s of messages — clearing history is a workaround, not a fix.**
+
+**Fix — enforce the contract in code, independent of context:**
+- The leak path was `_finalize_response` falling back to raw assistant text when no `send_message_to_user` was called.
+- Voice turns now guarantee: reply tool → else ONE corrective iteration (`<system_correction>` nudge) → else scripted safe fallback line. Raw model text can never be spoken to a caller.
+- Verified by monkeypatching the LLM to (a) never reply — safe fallback used, no leak; (b) recover on the corrective pass — proper reply surfaced.
+- Remaining (with-more-time): inspect the summarizer's output register; long-context eval fixture (200-message synthetic history + golden scenario assertions).
+
+### Resilience pass + the "Booking Check" incident
+
+- **Transient LLM timeout** (60s) killed a chat turn silently. Fixes: one retry on timeout/429/5xx in the OpenRouter client; chat failures now post a visible "something went wrong, mind sending that again?" instead of silence. (The suspected "system badly broken" moment — diagnosed as upstream weather, revert avoided; same turn succeeded on retry.)
+- **The Booking Check incident:** "what bookings do I have?" → no bookings tool existed → agent improvised: delegated to an execution agent → which only has EMAIL tools → crawled the user's Gmail for appointment info (privacy smell: patient email is not clinic data) → 90s batch timeout → FAILED → safety rule correctly escalated to human. Every step locally reasonable; the chain started from a missing capability.
+- Fixes: `lookup_appointments(patient_name)` tool reading the clinic's booking records (single source of truth); prompt rules — never search email or delegate for booking records; tool failures are momentary, re-attempt before claiming something is broken.
+- Lesson for the walkthrough: agents fail by IMPROVISING around capability gaps — the fix is completing the tool surface for the real user journeys (book → recall → [cancel/reschedule: future]), not punishing the improvisation.
+
 ## Test log
 
 - **2026-07-06** — three curl scenarios against `/voice/send`:

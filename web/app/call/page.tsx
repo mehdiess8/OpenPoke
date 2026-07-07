@@ -32,6 +32,12 @@ export default function CallPage() {
   // What the assistant is currently saying and how much has been spoken so far.
   const replyRef = useRef<{ text: string; heardChars: number }>({ text: '', heardChars: 0 });
   const interruptedRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const isBotSpeaking = useCallback(
+    () => (audioRef.current !== null && !audioRef.current.paused) || window.speechSynthesis.speaking,
+    []
+  );
 
   const setStatusBoth = useCallback((s: CallStatus) => {
     statusRef.current = s;
@@ -42,10 +48,19 @@ export default function CallPage() {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [turns, interim]);
 
-  // Speak a reply via browser TTS; mic stays open so the caller can barge in.
-  // The transcript bubble is revealed word-by-word via onboundary, so the
-  // screen never shows words that haven't been spoken yet.
-  const speak = useCallback(
+  const finishSpeaking = useCallback(
+    (text: string) => {
+      if (interruptedRef.current) return; // barge-in/hang-up already handled it
+      setTurns((prev) => [...prev, { role: 'assistant', text }]);
+      setLiveReply(null);
+      audioRef.current = null;
+      if (inCallRef.current && statusRef.current === 'speaking') setStatusBoth('listening');
+    },
+    [setStatusBoth]
+  );
+
+  // Fallback: browser TTS (robotic but dependable, exact word-level tracking).
+  const speakWithBrowser = useCallback(
     (text: string) => {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
@@ -54,25 +69,30 @@ export default function CallPage() {
       const preferred = voices.find((v) => v.name.includes('Samantha') || v.name.includes('Google US English'));
       if (preferred) utterance.voice = preferred;
 
-      interruptedRef.current = false;
-      replyRef.current = { text, heardChars: 0 };
-      setLiveReply({ text, chars: 0 });
-
       utterance.onstart = () => setStatusBoth('speaking');
       utterance.onboundary = (event: SpeechSynthesisEvent) => {
         const heard = event.charIndex + ((event as any).charLength || 0);
         replyRef.current.heardChars = heard;
         setLiveReply({ text, chars: heard });
       };
-      utterance.onend = () => {
-        if (interruptedRef.current) return; // barge-in/hang-up already handled it
-        setTurns((prev) => [...prev, { role: 'assistant', text }]);
-        setLiveReply(null);
-        if (inCallRef.current && statusRef.current === 'speaking') setStatusBoth('listening');
-      };
+      utterance.onend = () => finishSpeaking(text);
       window.speechSynthesis.speak(utterance);
     },
-    [setStatusBoth]
+    [setStatusBoth, finishSpeaking]
+  );
+
+  // Speak a reply via browser TTS. Server-side TTS (OpenRouter, sentence-chunk
+  // queueing) was built and evaluated — see /voice/tts + BUILD_JOURNAL — but
+  // rejected for the live call: per-sentence synthesis gaps and slower first
+  // audio felt worse than an instant robotic voice. Latency IS the product.
+  const speak = useCallback(
+    (text: string) => {
+      interruptedRef.current = false;
+      replyRef.current = { text, heardChars: 0 };
+      setLiveReply({ text, chars: 0 });
+      speakWithBrowser(text);
+    },
+    [speakWithBrowser]
   );
 
   // Barge-in: stop TTS, commit only what was actually heard to the transcript,
@@ -80,6 +100,10 @@ export default function CallPage() {
   const interruptSpeech = useCallback((notifyServer: boolean) => {
     interruptedRef.current = true;
     window.speechSynthesis.cancel();
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
     const { text, heardChars } = replyRef.current;
     const heard = text.slice(0, heardChars).trim();
     setTurns((prev) => [...prev, { role: 'assistant', text: heard ? `${heard} —` : '(interrupted)' }]);
@@ -152,7 +176,7 @@ export default function CallPage() {
       }
       if (interimText) {
         // Barge-in: caller started talking while the assistant is speaking.
-        if (window.speechSynthesis.speaking) {
+        if (isBotSpeaking()) {
           interruptSpeech(true);
           setStatusBoth('listening');
         }
@@ -183,12 +207,12 @@ export default function CallPage() {
     recognitionRef.current = recognition;
     recognition.start();
     setStatusBoth('listening');
-  }, [sendUtterance, setStatusBoth, interruptSpeech]);
+  }, [sendUtterance, setStatusBoth, interruptSpeech, isBotSpeaking]);
 
   const hangUp = useCallback(async () => {
     inCallRef.current = false;
     recognitionRef.current?.stop();
-    if (window.speechSynthesis.speaking) {
+    if (isBotSpeaking()) {
       interruptSpeech(false); // commit only the heard prefix; no server note needed, call is over
     }
     window.speechSynthesis.cancel();
@@ -209,7 +233,7 @@ export default function CallPage() {
     } catch {
       /* recap is best-effort */
     }
-  }, [setStatusBoth, interruptSpeech]);
+  }, [setStatusBoth, interruptSpeech, isBotSpeaking]);
 
   useEffect(() => {
     return () => {

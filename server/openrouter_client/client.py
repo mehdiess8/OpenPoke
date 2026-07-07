@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from ..config import get_settings
+
+logger = logging.getLogger("openpoke.server")
 
 OpenRouterBaseURL = "https://openrouter.ai/api/v1"
 
@@ -67,25 +71,42 @@ async def request_chat_completion(
 
     url = f"{base_url.rstrip('/')}/chat/completions"
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                url,
-                headers=_headers(api_key=api_key),
-                json=payload,
-                timeout=60.0,  # Set reasonable timeout instead of None
-            )
+    # One retry on timeout / transient upstream errors (5xx, 429). A single
+    # slow LLM request should degrade to a slower reply, not a failed turn.
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        async with httpx.AsyncClient() as client:
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
+                response = await client.post(
+                    url,
+                    headers=_headers(api_key=api_key),
+                    json=payload,
+                    timeout=60.0,
+                )
+                if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                    logger.warning(
+                        f"OpenRouter transient {response.status_code} — retrying (attempt 2/2)"
+                    )
+                    last_error = OpenRouterError(f"transient {response.status_code}")
+                    await asyncio.sleep(1.0)
+                    continue
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    _handle_response_error(exc)
+                return response.json()
+            except httpx.TimeoutException as exc:
+                last_error = exc
+                if attempt == 0:
+                    logger.warning("OpenRouter request timed out after 60s — retrying (attempt 2/2)")
+                    continue
+                raise OpenRouterError(f"OpenRouter request timed out twice: {exc}") from exc
+            except httpx.HTTPStatusError as exc:  # pragma: no cover - handled above
                 _handle_response_error(exc)
-            return response.json()
-        except httpx.HTTPStatusError as exc:  # pragma: no cover - handled above
-            _handle_response_error(exc)
-        except httpx.HTTPError as exc:
-            raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
+            except httpx.HTTPError as exc:
+                raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
 
-    raise OpenRouterError("OpenRouter request failed: unknown error")
+    raise OpenRouterError(f"OpenRouter request failed: {last_error}")
 
 
 __all__ = ["OpenRouterError", "request_chat_completion", "OpenRouterBaseURL"]

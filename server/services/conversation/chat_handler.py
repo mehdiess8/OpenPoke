@@ -40,9 +40,21 @@ async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, 
 
     async def _run_interaction() -> None:
         try:
-            await runtime.execute(user_message=user_content)
+            result = await runtime.execute(user_message=user_content)
+            if not result.success:
+                # The user must never be left staring at silence.
+                from ...services.conversation import get_conversation_log
+
+                get_conversation_log().record_reply(
+                    "Sorry — something went wrong on my end just now. Mind sending that again?"
+                )
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error("chat task failed", extra={"error": str(exc)})
+            logger.error(f"chat task failed: {exc}")
+            from ...services.conversation import get_conversation_log
+
+            get_conversation_log().record_reply(
+                "Sorry — something went wrong on my end just now. Mind sending that again?"
+            )
 
     asyncio.create_task(_run_interaction())
 

@@ -370,6 +370,31 @@ def book_appointment(
     return result
 
 
+def lookup_appointments(patient_name: str) -> Dict[str, Any]:
+    """List a patient's booked appointments from the clinic's booking records."""
+    if not _BOOKINGS_PATH.exists():
+        return {"appointments": [], "message": "No bookings on file."}
+    try:
+        bookings = json.loads(_BOOKINGS_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[scheduling] failed to read bookings: {exc}")
+        return {"error": "Could not read booking records."}
+
+    name = patient_name.strip().lower()
+    matches = [
+        {
+            "confirmation_number": b.get("confirmation_number"),
+            "date": b.get("date"),
+            "time": b.get("time"),
+            "reason_for_visit": b.get("reason_for_visit"),
+        }
+        for b in bookings
+        if b.get("patient_name", "").strip().lower() == name
+    ]
+    logger.info(f"[scheduling] found {len(matches)} appointments for {patient_name}")
+    return {"appointments": matches}
+
+
 def escalate_emergency(summary: str) -> Dict[str, Any]:
     """Log an emergency escalation (the agent delivers the 911 script)."""
     record = {

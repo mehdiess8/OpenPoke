@@ -42,6 +42,12 @@ def clear_history() -> ChatHistoryClearResponse:
     trigger_service = get_trigger_service()
     trigger_service.clear_all()
 
+    # Clear any active voice call session (otherwise a stale call transcript
+    # leaks into the first call after a reset)
+    from ..services.voice_call import get_call_session
+
+    get_call_session().clear()
+
     return ChatHistoryClearResponse()
 
 

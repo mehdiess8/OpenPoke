@@ -15,8 +15,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from ..agents.interaction_agent.runtime import InteractionAgentRuntime
@@ -114,6 +115,38 @@ async def voice_send(payload: VoiceRequest) -> JSONResponse:
             "emergency_flagged": alert is not None,
         }
     )
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+@router.post("/tts", summary="Synthesize a reply to speech via OpenRouter")
+# Convert reply text to natural speech; the frontend falls back to browser TTS on failure
+async def voice_tts(payload: TTSRequest) -> Response:
+    text = payload.text.strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "Empty text"}, status_code=400)
+
+    settings = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upstream = await client.post(
+                "https://openrouter.ai/api/v1/audio/speech",
+                headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
+                json={
+                    "model": settings.tts_model,
+                    "input": text,
+                    "voice": settings.tts_voice,
+                    "response_format": "mp3",
+                },
+            )
+        upstream.raise_for_status()
+        logger.info(f"[voice] tts synthesized {len(text)} chars ({len(upstream.content)} bytes)")
+        return Response(content=upstream.content, media_type="audio/mpeg")
+    except Exception as exc:
+        logger.warning(f"[voice] tts failed, frontend will fall back to browser voice: {exc}")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
 @router.post("/interrupted", response_class=JSONResponse, summary="Record that the caller interrupted the last reply")

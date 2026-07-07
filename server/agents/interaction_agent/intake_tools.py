@@ -68,6 +68,21 @@ INTAKE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "lookup_appointments",
+            "description": "List a patient's existing booked appointments (date, time, confirmation number). ALWAYS use this for questions like 'when is my appointment' or 'what bookings do I have' — never search email or delegate to agents for booking records.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_name": {"type": "string", "description": "Patient full name."},
+                },
+                "required": ["patient_name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "escalate_emergency",
             "description": "Log an emergency escalation when the caller may be in danger. Use together with telling the caller to hang up and call 911. Do not continue booking.",
             "parameters": {
@@ -102,6 +117,7 @@ _HANDLERS = {
     "lookup_patient": scheduling.lookup_patient,
     "check_availability": scheduling.check_availability,
     "book_appointment": scheduling.book_appointment,
+    "lookup_appointments": scheduling.lookup_appointments,
     "escalate_emergency": scheduling.escalate_emergency,
     "transfer_to_human": scheduling.transfer_to_human,
 }

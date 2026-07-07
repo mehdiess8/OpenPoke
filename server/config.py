@@ -57,6 +57,12 @@ class Settings(BaseModel):
     summarizer_model: str = Field(default="anthropic/claude-sonnet-4")
     email_classifier_model: str = Field(default="anthropic/claude-sonnet-4")
 
+    # Voice (TTS via OpenRouter's /audio/speech endpoint)
+    # kokoro-82m/af_heart: natural warm voice, ~0.4-0.8s per sentence, cheapest.
+    # Premium alternative: microsoft/mai-voice-2 + en-US-Ava:DragonHDLatestNeural (~1.2s/sentence).
+    tts_model: str = Field(default=os.getenv("OPENPOKE_TTS_MODEL", "hexgrad/kokoro-82m"))
+    tts_voice: str = Field(default=os.getenv("OPENPOKE_TTS_VOICE", "af_heart"))
+
     # Credentials / integrations
     openrouter_api_key: Optional[str] = Field(default=os.getenv("OPENROUTER_API_KEY"))
     composio_gmail_auth_config_id: Optional[str] = Field(default=os.getenv("COMPOSIO_GMAIL_AUTH_CONFIG_ID"))

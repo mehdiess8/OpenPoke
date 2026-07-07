@@ -46,6 +46,10 @@ class InteractionAgentRuntime:
 
     MAX_TOOL_ITERATIONS = 8
 
+    # Spoken when the model twice fails to produce a caller-facing reply —
+    # raw internal text must NEVER reach a caller's ears.
+    VOICE_SAFE_FALLBACK = "Sorry, I lost my train of thought for a second. Could you say that again?"
+
     # Initialize interaction agent runtime with settings and service dependencies
     def __init__(self) -> None:
         settings = get_settings()
@@ -101,7 +105,37 @@ class InteractionAgentRuntime:
             logger.info("Processing user message through interaction agent")
             summary = await self._run_interaction_loop(system_prompt, messages)
 
+            # OUTPUT CONTRACT (voice): every turn MUST produce a reply through
+            # send_message_to_user — the caller is on the line, and raw model
+            # text (plans, notes) must never be spoken. If the loop ends
+            # without one, run ONE corrective iteration; if that also fails,
+            # use a safe scripted line. This keeps behavior stable regardless
+            # of how long or strange the conversation context has become.
+            if channel == "voice" and not summary.user_messages:
+                logger.warning("[voice] no caller-facing reply produced — corrective iteration")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "<system_correction>\nYou have not said anything to the caller — "
+                            "they are waiting on the line in silence. Respond to them RIGHT NOW "
+                            "via the send_message_to_user tool. Output no plans or notes.\n"
+                            "</system_correction>"
+                        ),
+                    }
+                )
+                try:
+                    retry_summary = await self._run_interaction_loop(system_prompt, messages)
+                    if retry_summary.user_messages:
+                        summary = retry_summary
+                except Exception as retry_exc:  # pragma: no cover - defensive
+                    logger.error(f"[voice] corrective iteration failed: {retry_exc}")
+
             final_response = self._finalize_response(summary)
+
+            if channel == "voice" and not summary.user_messages:
+                logger.error("[voice] corrective iteration produced no reply — safe fallback used")
+                final_response = self.VOICE_SAFE_FALLBACK
 
             if final_response and not summary.user_messages:
                 if channel == "voice":
@@ -118,7 +152,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent failed", extra={"error": str(exc)})
+            logger.exception(f"Interaction agent failed: {exc}")
             return InteractionResult(
                 success=False,
                 response="",
